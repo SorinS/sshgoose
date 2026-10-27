@@ -1,1 +1,5 @@
 __pycache__/
+tools/goose-ssh
+tools/goose-sshd
+tools/goose_host_ed25519_key
+tools/goose_host_ed25519_key.pub

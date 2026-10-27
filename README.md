@@ -5,9 +5,8 @@ SSH (RFC 4251-4254) for the Goose language, as Go's
 cryptography and [x509](../x509goose.git) and [asn1](../asn1goose.git) for
 key files. Nothing here does I/O.
 
-Work in progress: the wire encoding, keys, the packet layer and the key
-exchanges are done; the connection (handshake, authentication, channels)
-comes next.
+Two programs come with it: `goose-ssh`, a client, and `goose-sshd`, a
+server (see below).
 
 - **`ssh`**: message numbers, the wire encoding (integers, strings, mpints,
   name-lists, RFC 4251 §5) and algorithm negotiation.
@@ -25,6 +24,46 @@ comes next.
   diffie-hellman-group14-sha256, group16-sha512 and group14-sha1
   (RFC 8268, over `bignum.ffdh`); the exchange hash and key derivation
   (RFC 4253 §7.2). The defaults are Go's.
+- **`ssh.conn`**: connections, client and server, without I/O: feed in the
+  bytes that arrive, get the bytes to send and a stream of events. Version
+  exchange, negotiation, strict key exchange (Terrapin), server-sig-algs
+  (RFC 8308), rekeying; the host key against known_hosts lines (patterns,
+  hashed entries, ports, @revoked), a fixed key, or put to the application;
+  publickey (query, then signature), password and keyboard-interactive
+  authentication both ways, the client asking for a password only when it
+  needs one; channels with flow control, data and stderr, exec, shell,
+  pty-req, env, subsystem, window-change, exit-status and exit-signal.
+
+## The programs
+
+```bash
+cd tools
+goose build -o goose-ssh ssh.goose
+goose build -o goose-sshd sshd.goose
+
+./goose-sshd -p 2222                       # 127.0.0.1:2222, ~/.ssh/authorized_keys
+./goose-ssh -p 2222 localhost              # an interactive shell
+./goose-ssh user@host.example.com uname -a # a command, its exit status ours
+```
+
+`goose-ssh` works as OpenSSH's `ssh` is used: `[user@]host`, `-p`, `-l`,
+`-i keyfile` (else `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`), `-t`/`-T`,
+`-v`, and `-o` with `StrictHostKeyChecking` (ask, the default; `yes`,
+`accept-new`, `no`), `UserKnownHostsFile`, `KexAlgorithms`, `Ciphers`,
+`MACs` and `HostKeyAlgorithms`. It checks `~/.ssh/known_hosts`, asks about
+a host it does not know and adds it, asks for a password only when the
+server takes one and no key worked, runs a command or a shell (on a pty,
+the terminal raw, its size passed on), and exits with the remote status.
+Passphrase-protected keys are not read yet.
+
+`goose-sshd` lets in the user running it: `-p port` (2222), `-a address`
+(127.0.0.1), `-h host_key_file` (`./goose_host_ed25519_key`, made on first
+start), `-k authorized_keys` (`~/.ssh/authorized_keys`), `-P
+password_file` ("user:password" lines, plain or bcrypt), `-u user`,
+`-b banner`, `-v`. Each connection is a process of its own; a session runs
+a command or the user's shell, on a pty when asked, and ends with its exit
+status. tools/net.c is their operating-system part (sockets, the terminal,
+processes), for macOS and Linux.
 
 ## Tests
 
@@ -44,6 +83,19 @@ python3 scripts/run_tests.py --native   # also built with the C compiler
   the other side measures from their first bytes and opens in sequence;
   a changed byte or a packet out of order does not open; every key
   exchange agrees on K both ways and refuses a bad public value.
+- `conn`: this client and server in memory: every key exchange, cipher,
+  MAC and host key type; each kind of login, refused ones, a password
+  asked for; every known_hosts case and the ask mode, which sends nothing
+  until the host key is accepted; sessions with exec, env and pty, 3 MB
+  each way through the windows, rekeys from both sides, disconnect.
+
+`scripts/interop.py` runs live connections on 127.0.0.1 (137 cases):
+goose-ssh against an OpenSSH sshd (10.3, run as the user, with DH and
+ssh-rsa enabled again), Go's x/crypto/ssh server and goose-sshd, with
+every key exchange, cipher and MAC, every host key type, Ed25519 and RSA
+user keys, 5 MB through cat, stderr and exit status, and the known_hosts
+cases; OpenSSH's ssh against goose-sshd likewise, with password and
+keyboard-interactive logins and a pty; Go's client against goose-sshd.
 
 `scripts/gossh` builds offline from the module cache
 (`GOFLAGS=-mod=mod GOPROXY=off GOSUMDB=off`).
