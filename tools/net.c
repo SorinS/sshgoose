@@ -88,17 +88,19 @@ int32_t net_listen(net_slice addr, int32_t port) {
     return fd;
 }
 
-/* A connection, and its peer's address as text into `peer`; its length
-   through peer_len. */
-int32_t net_accept(int32_t fd, net_buf peer, int64_t *peer_len) {
+/* A connection, and its peer's address as text into `peer`, its length
+   through peer_len, and its port through peer_port. */
+int32_t net_accept(int32_t fd, net_buf peer, int64_t *peer_len, int32_t *peer_port) {
     struct sockaddr_storage sa;
     socklen_t n = sizeof sa;
     int c;
     do { c = accept(fd, (struct sockaddr *)&sa, &n); } while (c < 0 && errno == EINTR);
     *peer_len = 0;
+    *peer_port = 0;
     if (c < 0) return -1;
-    char host[NI_MAXHOST];
-    if (getnameinfo((struct sockaddr *)&sa, n, host, sizeof host, NULL, 0, NI_NUMERICHOST) == 0) {
+    char host[NI_MAXHOST], serv[NI_MAXSERV];
+    if (getnameinfo((struct sockaddr *)&sa, n, host, sizeof host, serv, sizeof serv, NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+        *peer_port = atoi(serv);
         size_t l = strlen(host);
         if ((int64_t)l > peer.len) l = (size_t)peer.len;
         memcpy(peer.data, host, l);
@@ -129,6 +131,41 @@ int64_t net_write(int32_t fd, net_slice data) {
 }
 
 void net_close(int32_t fd) { if (fd >= 0) close(fd); }
+
+/* The port a socket is bound to (a listener's, after port 0). */
+int32_t net_local_port(int32_t fd) {
+    struct sockaddr_storage sa;
+    socklen_t n = sizeof sa;
+    if (getsockname(fd, (struct sockaddr *)&sa, &n) < 0) return -1;
+    if (sa.ss_family == AF_INET) return ntohs(((struct sockaddr_in *)&sa)->sin_port);
+    if (sa.ss_family == AF_INET6) return ntohs(((struct sockaddr_in6 *)&sa)->sin6_port);
+    return -1;
+}
+
+typedef struct { const int32_t *data; int64_t len; } net_fds;
+
+/* Waits up to timeout_ms for any descriptor of fds (-1 entries ignored, at
+   most 256) to be readable or closed: ready[i] is 1 for those that are.
+   How many are, 0 on timeout. */
+int32_t net_poll_set(net_fds fds, net_buf ready, int32_t timeout_ms) {
+    struct pollfd p[256];
+    int map[256];
+    int n = 0;
+    for (int64_t i = 0; i < fds.len && i < ready.len && n < 256; i++) {
+        ready.data[i] = 0;
+        if (fds.data[i] < 0) continue;
+        p[n].fd = fds.data[i];
+        p[n].events = POLLIN;
+        p[n].revents = 0;
+        map[n++] = (int)i;
+    }
+    int r;
+    do { r = poll(p, (nfds_t)n, timeout_ms); } while (r < 0 && errno == EINTR);
+    if (r <= 0) return r;
+    for (int i = 0; i < n; i++)
+        if (p[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) ready.data[map[i]] = 1;
+    return r;
+}
 
 void net_shutdown_write(int32_t fd) { if (fd >= 0) shutdown(fd, SHUT_WR); }
 

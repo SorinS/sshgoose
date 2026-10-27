@@ -15,11 +15,17 @@
 //	    one connection running the command: prints its stdout and stderr, then
 //	    "exit=<status>"; $GOSSH_KEX, $GOSSH_CIPHERS and $GOSSH_MACS set the
 //	    algorithms (comma-separated)
+//	gossh dial <port> <user> <key file> <host key line> <host:port> <path>
+//	    a direct-tcpip channel to host:port, through which it GETs path over
+//	    HTTP/1.0; prints the body's length and SHA-256
+//
+// The server also connects direct-tcpip channels to their target.
 package main
 
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -52,6 +58,35 @@ func serve(nc net.Conn, cfg *ssh.ServerConfig) {
 	}
 	go ssh.DiscardRequests(reqs)
 	for nch := range chans {
+		if nch.ChannelType() == "direct-tcpip" {
+			var t struct {
+				Host     string
+				Port     uint32
+				OrigHost string
+				OrigPort uint32
+			}
+			ssh.Unmarshal(nch.ExtraData(), &t)
+			tc, err := net.Dial("tcp", net.JoinHostPort(t.Host, fmt.Sprint(t.Port)))
+			if err != nil {
+				nch.Reject(ssh.ConnectionFailed, err.Error())
+				continue
+			}
+			ch, reqs, err := nch.Accept()
+			if err != nil {
+				tc.Close()
+				continue
+			}
+			go ssh.DiscardRequests(reqs)
+			go func() {
+				io.Copy(ch, tc)
+				ch.CloseWrite()
+			}()
+			go func() {
+				io.Copy(tc, ch)
+				tc.(*net.TCPConn).CloseWrite()
+			}()
+			continue
+		}
 		if nch.ChannelType() != "session" {
 			nch.Reject(ssh.UnknownChannelType, "no")
 			continue
@@ -194,6 +229,29 @@ func main() {
 		fmt.Print(stdout.String())
 		fmt.Print(stderr.String())
 		fmt.Printf("exit=%d\n", status)
+		client.Close()
+	case "dial":
+		hostKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(os.Args[5]))
+		must(err)
+		pem, err := os.ReadFile(os.Args[4])
+		must(err)
+		signer, err := ssh.ParsePrivateKey(pem)
+		must(err)
+		cfg := &ssh.ClientConfig{User: os.Args[3], HostKeyCallback: ssh.FixedHostKey(hostKey),
+			Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}}
+		client, err := ssh.Dial("tcp", "127.0.0.1:"+os.Args[2], cfg)
+		must(err)
+		conn, err := client.Dial("tcp", os.Args[6])
+		must(err)
+		fmt.Fprintf(conn, "GET %s HTTP/1.0\r\n\r\n", os.Args[7])
+		resp, err := io.ReadAll(conn)
+		must(err)
+		i := bytes.Index(resp, []byte("\r\n\r\n"))
+		if i < 0 {
+			must(errors.New("no HTTP body"))
+		}
+		body := resp[i+4:]
+		fmt.Printf("%d %x\n", len(body), sha256.Sum256(body))
 		client.Close()
 	case "verify":
 		pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(os.Args[2]))

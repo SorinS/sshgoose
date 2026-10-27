@@ -10,7 +10,10 @@ import os;
 extern fn net_init();
 extern fn net_connect(host: const u8[:], port: i32) -> i32;
 extern fn net_listen(addr: const u8[:], port: i32) -> i32;
-extern fn net_accept(fd: i32, peer: u8[:], peer_len: i64&) -> i32;
+extern fn net_accept(fd: i32, peer: u8[:], peer_len: i64&, peer_port: i32&) -> i32;
+extern fn net_local_port(fd: i32) -> i32;
+// ready[i] = 1 for each fds[i] (-1: none) readable or closed; how many, 0 on timeout.
+extern fn net_poll_set(fds: const i32[:], ready: u8[:], timeout_ms: i32) -> i32;
 extern fn net_read(fd: i32, buf: u8[:]) -> i64;
 extern fn net_write(fd: i32, data: const u8[:]) -> i64;
 extern fn net_close(fd: i32);

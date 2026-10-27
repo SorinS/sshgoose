@@ -2,7 +2,7 @@
 // running it:
 //
 //   goose-sshd [-p port] [-a address] [-h host_key_file]... [-k authorized_keys]
-//              [-P password_file] [-u user] [-b banner] [-v]
+//              [-P password_file] [-u user] [-b banner] [-g] [-v]
 //
 // It listens on 127.0.0.1:2222 by default (-a 0.0.0.0 for every address),
 // with the host keys given (by default ./goose_host_ed25519_key, made on
@@ -14,6 +14,11 @@
 // runs a command (exec) or the user's shell (shell), on a pseudo-terminal
 // when the client asks for one (pty-req, then window-change), with the
 // environment the client sends (env), and ends with the exit status.
+// Port forwarding: direct-tcpip channels (the client's -L and -D) are
+// connected to their target; tcpip-forward (-R) listens on the loopback
+// address (on any address the client names with -g, as OpenSSH's
+// GatewayPorts) and sends each connection back as a forwarded-tcpip
+// channel; cancel-tcpip-forward stops it.
 import std;
 import os;
 import ssh from "..";
@@ -23,13 +28,15 @@ import x509 from "../../x509goose.git";
 import ssh.keys;
 import ssh.conn;
 import .sysnet;
+import .relay;
 
 var verbose = false;
+var gateway_ports = false;
 
 fn log(s: const u8[:]) { if verbose { sysnet::eprint(str("goose-sshd: ", s, "\n")); } }
 
 fn usage() {
-    sysnet::eprint("usage: goose-sshd [-p port] [-a address] [-h host_key_file]... [-k authorized_keys] [-P password_file] [-u user] [-b banner] [-v]\n");
+    sysnet::eprint("usage: goose-sshd [-p port] [-a address] [-h host_key_file]... [-k authorized_keys] [-P password_file] [-u user] [-b banner] [-g] [-v]\n");
     exit(1);
 }
 
@@ -107,11 +114,20 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
     ssh::server_start(c, cfg, out);
     if !send_all(sock, out) { return; }
     var s = no_session();
+    var rl = relay::new_relay(verbose);
     var input: u8[>..] = [];
     loop {
         let watch_out = s.pid > 0 && !s.out_eof && s.pending.len == 0;
         let watch_err = s.pid > 0 && !s.err_eof && s.pending_err.len == 0;
-        let ready = sysnet::net_poll(sock, if watch_out { s.out_fd } else { -1 }, if watch_err { s.err_fd } else { -1 }, -1, 200);
+        var fds: i32[>..] = [];
+        fds.push(sock);
+        fds.push(if watch_out { s.out_fd } else { -1 });
+        fds.push(if watch_err { s.err_fd } else { -1 });
+        relay::poll_fds(rl, c, fds);
+        var flags: u8[>..] = [];
+        flags.resize(fds.len, 0);
+        let nready = sysnet::net_poll_set(fds, flags, 200);
+        let ready = (if flags[0] != 0 { 1 } else { 0 }) | (if flags[1] != 0 { 2 } else { 0 }) | (if flags[2] != 0 { 4 } else { 0 });
         var events: u8[>..] = [];
         if (ready & 1) != 0 {
             input.clear();
@@ -134,6 +150,37 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
             let e, ok = ssh::next_event(events, pos);
             if !ok { break; }
             var r = e.data;
+            // A forward's channel.
+            if e.channel != s.ch && e.kind != ssh::EV_CHANNEL_OPEN && e.kind != ssh::EV_GLOBAL_REQUEST &&
+               relay::on_event(rl, c, e, events, out) {
+                continue;
+            }
+            if e.kind == ssh::EV_GLOBAL_REQUEST {
+                let name = ssh::get_string(r, events);
+                let nm = ssh::bytes(events, name);
+                var ok3 = false;
+                var fields: u8[>..] = [];
+                if nm == "tcpip-forward" || nm == "cancel-tcpip-forward" {
+                    let addr = ssh::get_string(r, events);
+                    let port: i64 = ssh::get_u32(r, events);
+                    let a = ssh::bytes(events, addr);
+                    if !r.bad && nm == "tcpip-forward" {
+                        // Loopback only, unless -g; "" and "*" are every address.
+                        let loopback = a == "localhost" || a == "127.0.0.1" || a == "::1";
+                        var bind: u8[>..] = [];
+                        if loopback || !gateway_ports { bind.append("127.0.0.1"); }
+                        else if a != "" && a != "*" && a != "0.0.0.0" { bind.append(a); }
+                        ok3 = port < 65536 && relay::listen(rl, relay::FWD_REMOTE, bind, port, a, 0);
+                        if ok3 && port == 0 { ssh::put_u32(fields, rl.listeners[rl.listeners.len - 1].port as! u32); }
+                        log(str("tcpip-forward ", a, ":", port, if ok3 { "" } else { " refused" }));
+                    } else if !r.bad {
+                        let li = relay::listener_at(rl, port);
+                        if li >= 0 { relay::close_listener(rl, li); ok3 = true; }
+                    }
+                }
+                if e.value == 1 { let x = ssh::global_reply(c, ok3, fields, out); }
+                continue;
+            }
             if e.kind == ssh::EV_AUTHENTICATED {
                 log(str("accepted ", ssh::bytes(events, e.data), " from ", peer));
             } else if e.kind == ssh::EV_CHANNEL_OPEN {
@@ -141,6 +188,11 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
                 if ssh::bytes(events, kind) == "session" && s.ch < 0 {
                     let a = ssh::channel_accept(c, e.channel, out);
                     s.ch = e.channel;
+                } else if ssh::bytes(events, kind) == "direct-tcpip" {
+                    let host = ssh::get_string(r, events);
+                    let port: i64 = ssh::get_u32(r, events);
+                    if r.bad { let x = ssh::channel_reject(c, e.channel, ssh::OPEN_CONNECT_FAILED, "bad request", out); }
+                    else { let x = relay::connect_channel(rl, c, e.channel, ssh::bytes(events, host), port, out); }
                 } else {
                     let a = ssh::channel_reject(c, e.channel, ssh::OPEN_ADMINISTRATIVELY_PROHIBITED, "one session at a time", out);
                 }
@@ -211,6 +263,7 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
                 s.finished = true;
             }
         }
+        relay::service(rl, c, fds, flags, 3, out);
         // The child's output into the channel, as its window allows.
         if s.ch >= 0 && ssh::connected(c) {
             if s.pending.len > 0 {
@@ -273,6 +326,7 @@ fn main() {
     while i < a.len {
         let w = a[i];
         if w == "-v" { verbose = true; i++; continue; }
+        if w == "-g" { gateway_ports = true; i++; continue; }
         if i + 1 >= a.len { usage(); }
         if w == "-p" {
             let v, ok = parse_int(a[i + 1], 10);
@@ -315,7 +369,8 @@ fn main() {
     loop {
         var peer: u8[64] = [0; 64];
         var plen: i64 = 0;
-        let fd = sysnet::net_accept(lfd, peer, plen);
+        var pport: i32 = 0;
+        let fd = sysnet::net_accept(lfd, peer, plen, pport);
         sysnet::proc_reap();
         if fd < 0 { continue; }
         log(str("connection from ", peer[..plen]));

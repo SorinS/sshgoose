@@ -17,12 +17,17 @@ as this user (its own config, DH and ssh-rsa enabled again, since OpenSSH
   and RSA keys, password and keyboard-interactive (through SSH_ASKPASS), a
   pty, 5 MB through cat, exit status;
 - Go's client to goose-sshd: key exchanges, ciphers, a password.
+- Port forwarding, a 1 MB file fetched twice over HTTP through each forward:
+  goose-ssh's -L, -D (SOCKS5) and -R through OpenSSH sshd and goose-sshd,
+  -L and -D through Go's server; OpenSSH ssh's -L, -D, -R and -R with port
+  0 through goose-sshd; Go's client's direct-tcpip through goose-sshd.
 
     python3 scripts/interop.py [--goose PATH]
 """
 
 import hashlib
 import os
+import select
 import shutil
 import socket
 import subprocess
@@ -209,6 +214,72 @@ def main():
             check(f"Go client -> goose-sshd, {c}, RSA key", out == b"ok\nexit=0\n", (rc, out, err))
         rc, out, err = run([k("gossh"), "client", str(p_goose), USER, "-", hk, "echo ok", "letmein"])
         check("Go client -> goose-sshd, password", out == b"ok\nexit=0\n", (rc, out, err))
+
+        # Port forwarding: a file over HTTP through each kind of forward.
+        os.makedirs(k("www"))
+        page = os.urandom(1_000_000)
+        with open(k("www/file.bin"), "wb") as f:
+            f.write(page)
+        page_digest = hashlib.sha256(page).hexdigest()
+        p_http = free_port()
+        servers.append(subprocess.Popen([sys.executable, "-m", "http.server", str(p_http), "--bind", "127.0.0.1",
+                                         "--directory", k("www")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        if not wait_port(p_http):
+            sys.exit("the HTTP server did not start")
+
+        def fetch(port, socks=None):
+            cmd = ["curl", "-s", "--max-time", "30", "-o", "-"]
+            url = f"http://127.0.0.1:{port}/file.bin"
+            if socks:
+                cmd += ["--socks5-hostname", f"127.0.0.1:{socks}"]
+                url = f"http://127.0.0.1:{p_http}/file.bin"
+            rc, out, err = run([*cmd, url], timeout=60)
+            return out
+
+        def forward_case(name, cmd, listen, socks=False, allocated=False):
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            port = listen
+            if allocated:
+                # "Allocated port N for remote forward to ..." on stderr.
+                port = None
+                end = time.time() + 15
+                buf = b""
+                while time.time() < end and port is None:
+                    r, _, _ = select.select([proc.stderr], [], [], 1)
+                    if r:
+                        buf += os.read(proc.stderr.fileno(), 4096)
+                        for line in buf.split(b"\n"):
+                            if line.startswith(b"Allocated port "):
+                                port = int(line.split()[2])
+            ok = port is not None and wait_port(port, 15)
+            bodies = [fetch(port, port if socks else None) for _ in range(2)] if ok else []
+            proc.kill()
+            err = proc.stderr.read()[-300:] if proc.stderr else b""
+            good = ok and all(hashlib.sha256(b).hexdigest() == page_digest for b in bodies)
+            check(name, good, (port, [len(b) for b in bodies], err))
+
+        for port, name in ((p_openssh, "OpenSSH sshd"), (p_goose, "goose-sshd"), (p_go, "Go")):
+            base = [k("goose-ssh"), "-N", "-p", str(port), "-i", k("user_ed25519"), "-o",
+                    f"UserKnownHostsFile={k('known_hosts')}", "-o", "StrictHostKeyChecking=yes"]
+            lp = free_port()
+            forward_case(f"goose-ssh -L through {name}", [*base, "-L", f"{lp}:127.0.0.1:{p_http}", "127.0.0.1"], lp)
+            dp = free_port()
+            forward_case(f"goose-ssh -D (SOCKS5) through {name}", [*base, "-D", str(dp), "127.0.0.1"], dp, socks=True)
+            if port != p_go:
+                rp = free_port()
+                forward_case(f"goose-ssh -R through {name}", [*base, "-R", f"{rp}:127.0.0.1:{p_http}", "127.0.0.1"], rp)
+        obase = ["ssh", "-N", "-p", str(p_goose), "-i", k("user_ed25519"), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                 "-o", f"UserKnownHostsFile={k('known_hosts')}", "-o", "ExitOnForwardFailure=yes"]
+        lp = free_port()
+        forward_case("OpenSSH ssh -L through goose-sshd", [*obase, "-L", f"{lp}:127.0.0.1:{p_http}", "127.0.0.1"], lp)
+        dp = free_port()
+        forward_case("OpenSSH ssh -D through goose-sshd", [*obase, "-D", str(dp), "127.0.0.1"], dp, socks=True)
+        rp = free_port()
+        forward_case("OpenSSH ssh -R through goose-sshd", [*obase, "-R", f"{rp}:127.0.0.1:{p_http}", "127.0.0.1"], rp)
+        forward_case("OpenSSH ssh -R port 0 through goose-sshd", [*obase, "-R", f"0:127.0.0.1:{p_http}", "127.0.0.1"], None,
+                     allocated=True)
+        rc, out, err = run([k("gossh"), "dial", str(p_goose), USER, k("user_ed25519"), hk, f"127.0.0.1:{p_http}", "/file.bin"])
+        check("Go client direct-tcpip through goose-sshd", out == f"{len(page)} {page_digest}\n".encode(), (rc, out, err))
     finally:
         for s in servers:
             s.kill()

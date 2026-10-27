@@ -21,6 +21,9 @@
 // bcrypt). Channels: sessions and any other type the application accepts,
 // flow control, data and stderr, requests (exec, shell, pty-req, env,
 // subsystem, exit-status, exit-signal) and their replies, EOF and close.
+// Port forwarding (RFC 4254 §7): direct-tcpip channels, tcpip-forward and
+// cancel-tcpip-forward requests and forwarded-tcpip channels, the
+// application doing the connecting and listening.
 
 namespace ssh;
 
@@ -70,7 +73,8 @@ let EV_REQUEST_REPLY: u8 = 11;         // value: 1 for success
 let EV_EXIT_STATUS: u8 = 12;           // value: the status
 let EV_EXIT_SIGNAL: u8 = 13;           // data: the signal's name
 let EV_WINDOW: u8 = 14;                // the peer took more data: channel_send may send again
-let EV_GLOBAL_REQUEST: u8 = 15;        // value: want_reply; data: string name, then its fields
+let EV_GLOBAL_REQUEST: u8 = 15;        // value: want_reply; data: string name, then its fields (server: answer with global_reply)
+let EV_GLOBAL_REPLY: u8 = 20;          // value: 1 for success; data: the reply's fields (a port for tcpip-forward on port 0)
 let EV_DISCONNECT: u8 = 16;            // value: the reason; data: the description
 let EV_HOST_KEY: u8 = 17;              // client: data: the server's host key blob, once checked
 let EV_HOST_KEY_UNKNOWN: u8 = 19;      // client, HOST_KEY_ASK: data: the key blob; host_key_accept or disconnect
@@ -95,7 +99,7 @@ let CH_OPEN: i64 = 3;
 // (Go's: 64 packets of 32 KB).
 let CHANNEL_WINDOW: u32 = 2097152;
 let CHANNEL_MAX_PACKET: u32 = 32768;
-let MAX_CHANNELS: i64 = 8;
+let MAX_CHANNELS: i64 = 64;
 
 // What a client needs: the user, the host (and port) it connects to, for
 // the host key check; its keys and password; how to check the host key,
@@ -216,7 +220,8 @@ struct Conn {
     // finishing it needs.
     host_key_wait: bool, held_k: u8[..2200], held_h: u8[..64],
     auth_methods: u8[..256],                   // what the server's last failure allowed
-    channels: Channel[..8],
+    global_replies: i64,                       // the peer's global requests awaiting the application's reply
+    channels: Channel[..64],
     inbuf: u8[..270000],
 }
 
@@ -230,7 +235,7 @@ fn new_conn(is_server: bool) -> Conn {
         kex_count: 0, ignore_next: false, tx: no_cipher(), rx: no_cipher(), tx_next: no_cipher(), rx_next: no_cipher(),
         bytes_since_kex: 0, user: [], auth_step: AUTH_NONE, key_index: 0, password_tried: false, kbd_tried: false,
         auth_tries: 0, kbd_pending: false, banner_sent: false, password: [], has_password: false, host_key_wait: false, held_k: [], held_h: [],
-        auth_methods: [], channels: [], inbuf: [],
+        auth_methods: [], global_replies: 0, channels: [], inbuf: [],
     };
     for i in MAX_CHANNELS { c.channels.push(free_channel()); }
     return c;
@@ -1315,6 +1320,81 @@ fn channel_reply(c: Conn&, ch: i64, ok: bool, out: u8[>..]&) -> bool {
     return true;
 }
 
+// How many bytes channel_send would take now: the peer's window, at most
+// one packet; 0 for a channel that takes none.
+fn channel_window(c: const Conn&, ch: i64) -> i64 {
+    if !channel_ok(c, ch) || c.in_kex || c.channels[ch].sent_eof || c.channels[ch].sent_close { return 0; }
+    let w: i64 = c.channels[ch].out_window;
+    let mp: i64 = c.channels[ch].out_max;
+    return ::min(w, mp);
+}
+
+// --- Global requests and port forwarding ---------------------------------------------
+
+// A global request; EV_GLOBAL_REPLY follows if want_reply (replies come in
+// the order the requests went).
+fn global_request(c: Conn&, name: const u8[:], want_reply: bool, fields: const u8[:], out: u8[>..]&) -> bool {
+    if c.state != ST_CONNECTED || c.in_kex { return false; }
+    var b: u8[>..] = [];
+    b.push(MSG_GLOBAL_REQUEST);
+    put_string(b, name);
+    put_bool(b, want_reply);
+    b.append(fields);
+    send_packet(c, b, out);
+    return true;
+}
+
+// The server's reply to a global request that wanted one (EV_GLOBAL_REQUEST
+// with value 1), in order, with fields for a success.
+fn global_reply(c: Conn&, ok: bool, fields: const u8[:], out: u8[>..]&) -> bool {
+    if c.global_replies == 0 { return false; }
+    c.global_replies--;
+    var b: u8[>..] = [];
+    b.push(if ok { MSG_REQUEST_SUCCESS } else { MSG_REQUEST_FAILURE });
+    if ok { b.append(fields); }
+    send_packet(c, b, out);
+    return true;
+}
+
+// A direct-tcpip channel (-L, -D): the server connects to host:port; the
+// originator is where the connection came from.
+fn open_direct_tcpip(c: Conn&, host: const u8[:], port: u32, orig_host: const u8[:], orig_port: u32,
+                     out: u8[>..]&) -> i64 {
+    var f: u8[>..] = [];
+    put_string(f, host);
+    put_u32(f, port);
+    put_string(f, orig_host);
+    put_u32(f, orig_port);
+    return open_channel(c, "direct-tcpip", f, out);
+}
+
+// Asks the server to listen on address:port for the client (-R; port 0:
+// any, the reply naming it).
+fn tcpip_forward(c: Conn&, address: const u8[:], port: u32, out: u8[>..]&) -> bool {
+    var f: u8[>..] = [];
+    put_string(f, address);
+    put_u32(f, port);
+    return global_request(c, "tcpip-forward", true, f, out);
+}
+
+fn cancel_tcpip_forward(c: Conn&, address: const u8[:], port: u32, out: u8[>..]&) -> bool {
+    var f: u8[>..] = [];
+    put_string(f, address);
+    put_u32(f, port);
+    return global_request(c, "cancel-tcpip-forward", true, f, out);
+}
+
+// The server's channel for a connection to a forwarded address:port.
+fn open_forwarded_tcpip(c: Conn&, address: const u8[:], port: u32, orig_host: const u8[:], orig_port: u32,
+                        out: u8[>..]&) -> i64 {
+    var f: u8[>..] = [];
+    put_string(f, address);
+    put_u32(f, port);
+    put_string(f, orig_host);
+    put_u32(f, orig_port);
+    return open_channel(c, "forwarded-tcpip", f, out);
+}
+
 // The channel a message names (its first field, our number); -1 for none.
 fn channel_of(c: const Conn&, m: const u8[:], r: Rd&) -> i64 {
     let n: i64 = get_u32(r, m);
@@ -1329,19 +1409,25 @@ fn connection_message(c: Conn&, m: const u8[:], out: u8[>..]&, events: u8[>..]&)
         let name = get_string(r, m);
         let want = get_bool(r, m);
         if r.bad { return fail(c, DISCONNECT_PROTOCOL_ERROR, "bad GLOBAL_REQUEST", out); }
-        // None is handled here (keepalive@openssh.com, hostkeys-00@openssh.com
-        // and the like): a failure if a reply is wanted, as Go answers.
+        // The server's application answers (tcpip-forward); the client
+        // turns down what servers send it (keepalive@openssh.com wanting a
+        // reply; hostkeys-00@openssh.com does not), as Go does.
         var d: u8[>..] = [];
         put_string(d, bytes(m, name));
         d.append(m[r.pos..]);
         event(events, EV_GLOBAL_REQUEST, 0, if want { 1 } else { 0 }, d);
-        if want {
+        if want && c.is_server {
+            c.global_replies++;
+        } else if want {
             let b: u8[1] = [MSG_REQUEST_FAILURE];
             send_packet(c, b, out);
         }
         return 0;
     }
-    if t == MSG_REQUEST_SUCCESS || t == MSG_REQUEST_FAILURE { return 0; }
+    if t == MSG_REQUEST_SUCCESS || t == MSG_REQUEST_FAILURE {
+        event(events, EV_GLOBAL_REPLY, 0, if t == MSG_REQUEST_SUCCESS { 1 } else { 0 }, m[1..]);
+        return 0;
+    }
     if t == MSG_CHANNEL_OPEN {
         let kind = get_string(r, m);
         let sender = get_u32(r, m);
