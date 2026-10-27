@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -220,11 +221,42 @@ int32_t tty_rows(int32_t fd) {
     return ioctl(fd, TIOCGWINSZ, &w) == 0 && w.ws_row ? w.ws_row : 24;
 }
 
-/* A line typed at the terminal without echo, after a prompt: its length,
-   or -1 without a terminal. */
+/* $SSH_ASKPASS run with the prompt, its first line of output the answer. */
+static int64_t askpass(const char *prog, net_slice prompt, net_buf out) {
+    char p[1024];
+    if (cstring(prompt, p, sizeof p) < 0) return -1;
+    int fds[2];
+    if (pipe(fds) < 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
+    if (pid == 0) {
+        dup2(fds[1], 1);
+        close(fds[0]);
+        close(fds[1]);
+        execlp(prog, prog, p, (char *)0);
+        _exit(127);
+    }
+    close(fds[1]);
+    int64_t n = 0;
+    char ch;
+    while (n < out.len && read(fds[0], &ch, 1) == 1 && ch != '\n' && ch != '\r') out.data[n++] = (uint8_t)ch;
+    close(fds[0]);
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? n : -1;
+}
+
+/* A secret typed at the terminal, not echoed, or from $SSH_ASKPASS as
+   OpenSSH's ssh has it: always with $SSH_ASKPASS_REQUIRE "force" or
+   "prefer", never with "never", else when there is no terminal. Its
+   length, or -1 for neither. */
 int64_t tty_secret(net_slice prompt, net_buf out) {
+    const char *prog = getenv("SSH_ASKPASS");
+    const char *req = getenv("SSH_ASKPASS_REQUIRE");
+    int use = prog && *prog && !(req && strcmp(req, "never") == 0);
+    if (use && req && (strcmp(req, "force") == 0 || strcmp(req, "prefer") == 0)) return askpass(prog, prompt, out);
     int fd = open("/dev/tty", O_RDWR);
-    if (fd < 0) return -1;
+    if (fd < 0) return use ? askpass(prog, prompt, out) : -1;
     if (write(fd, prompt.data, (size_t)prompt.len) < 0) { close(fd); return -1; }
     struct termios t, quiet;
     tcgetattr(fd, &t);
@@ -394,6 +426,13 @@ int64_t os_user(net_buf out) {
     if ((int64_t)l > out.len) l = (size_t)out.len;
     memcpy(out.data, u, l);
     return (int64_t)l;
+}
+
+/* chmod(2); 0 or -1. */
+int32_t os_chmod(net_slice path, int32_t mode) {
+    char p[4096];
+    if (cstring(path, p, sizeof p) < 0) return -1;
+    return chmod(p, (mode_t)mode);
 }
 
 int64_t os_home(net_buf out) {

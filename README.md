@@ -5,16 +5,19 @@ SSH (RFC 4251-4254) for the Goose language, as Go's
 cryptography and [x509](../x509goose.git) and [asn1](../asn1goose.git) for
 key files. Nothing here does I/O.
 
-Two programs come with it: `goose-ssh`, a client, and `goose-sshd`, a
-server (see below).
+Three programs come with it: `goose-ssh`, a client, `goose-sshd`, a
+server, and `goose-ssh-keygen` (see below).
 
 - **`ssh`**: message numbers, the wire encoding (integers, strings, mpints,
   name-lists, RFC 4251 §5) and algorithm negotiation.
 - **`ssh.keys`**: public keys and signatures: Ed25519 (RFC 8709), ECDSA on
   P-256, P-384 and P-521 (RFC 5656), RSA with rsa-sha2-256, rsa-sha2-512
   (RFC 8332) and ssh-rsa; authorized_keys lines with options; private keys
-  in OpenSSH's format (openssh-key-v1, unencrypted for now) and PEM
-  (PKCS #1, SEC 1, PKCS #8); SHA-256 and MD5 fingerprints; key generation.
+  in OpenSSH's format (openssh-key-v1), passphrase-protected with
+  bcrypt_pbkdf under any of OpenSSH's key file ciphers (aes128/192/256-ctr
+  and -cbc, aes128/256-gcm@openssh.com, chacha20-poly1305@openssh.com) or
+  not, read and written, and PEM (PKCS #1, SEC 1, PKCS #8); SHA-256 and
+  MD5 fingerprints; key generation.
 - **`ssh.cipher`**: the binary packet protocol (RFC 4253 §6) under
   chacha20-poly1305@openssh.com, aes128/256-gcm@openssh.com (RFC 5647),
   and aes128/192/256-ctr (RFC 4344) with hmac-sha2-256, hmac-sha2-512 or
@@ -43,6 +46,7 @@ server (see below).
 cd tools
 goose build -o goose-ssh ssh.goose
 goose build -o goose-sshd sshd.goose
+goose build -o goose-ssh-keygen keygen.goose
 
 ./goose-sshd -p 2222                       # 127.0.0.1:2222, ~/.ssh/authorized_keys
 ./goose-ssh -p 2222 localhost              # an interactive shell
@@ -61,7 +65,10 @@ It forwards ports as OpenSSH does: `-L [bind:]port:host:hostport` (a local
 port, the server connecting), `-R [bind:]port:host:hostport` (a port on the
 server, connected from here; port 0 has the server pick one, which it
 prints), `-D [bind:]port` (a SOCKS5 proxy), and `-N` for forwards alone.
-Passphrase-protected keys are not read yet.
+For a passphrase-protected key it asks for the passphrase (three tries;
+empty skips the key) at the terminal, or runs `$SSH_ASKPASS` as ssh does
+(always with `SSH_ASKPASS_REQUIRE=force` or `prefer`, else when there is
+no terminal); password prompts likewise.
 
 `goose-sshd` lets in the user running it: `-p port` (2222), `-a address`
 (127.0.0.1), `-h host_key_file` (`./goose_host_ed25519_key`, made on first
@@ -74,20 +81,43 @@ and listens for -R on the loopback address (on the address asked for with
 `-g`, as OpenSSH's GatewayPorts). tools/net.c is their operating-system part (sockets, the terminal,
 processes), for macOS and Linux.
 
+`goose-ssh-keygen` makes key files as ssh-keygen does: `-t ed25519`
+(the default), `ecdsa` (`-b 256`, `384`, `521`) or `rsa` (`-b`, 3072),
+`-C comment`, `-N passphrase` (else asked twice; empty for none), `-Z
+cipher` (aes256-ctr), `-a rounds` (16), `-f file` (`~/.ssh/id_<type>`),
+the key in OpenSSH's format with mode 0600 and `file.pub` beside it. `-y
+[-P passphrase] -f file` prints the public line, `-p [-P old] [-N new] -f
+file` changes the passphrase, `-l [-E sha256|md5] -f file` prints the
+fingerprint.
+
 ## Tests
 
 ```bash
 python3 scripts/run_tests.py            # at -O0, -O2 and --debug
 python3 scripts/run_tests.py --native   # also built with the C compiler
+python3 scripts/interop.py              # live, against OpenSSH and Go (below)
+python3 scripts/gen_keys.py             # remake test/vectors (ssh-keygen, openssl, Go)
+tools/gossh.sh <mode> ...               # Go's side by hand (modes in tools/gossh/main.go)
 ```
+
+They take the compiler from `$GOOSE`, else `goose` on PATH, else
+`../goose.git/build/goose` (run_tests.py also takes `--goose`), and bigmongoose.git, asn1goose.git and
+x509goose.git beside this repository. interop.py also needs OpenSSH
+(`ssh`, `sshd`, `ssh-keygen`), Go with golang.org/x/crypto v0.55.0 in the
+module cache, `curl` and Python's http.server; it runs everything as you,
+on free ports of 127.0.0.1, and leaves nothing running.
 
 - `keys`: the wire encoding and negotiation; every key file of
   `test/vectors` (made by `scripts/gen_keys.py` with ssh-keygen and
   OpenSSL) parses to its `.pub` line's key with ssh-keygen's fingerprints;
-  Go's signatures (`scripts/gossh`, x/crypto/ssh) verify for every
+  Go's signatures (`tools/gossh`, x/crypto/ssh) verify for every
   algorithm, and Ed25519 and RSA signatures made here equal Go's; changed
   signatures, other algorithms and other keys are refused; authorized_keys
-  options and comments; keys written in OpenSSH's format read back.
+  options and comments; keys written in OpenSSH's format read back;
+  passphrase-protected keys, ssh-keygen's under each of the nine key file
+  ciphers and one of Go's: refused without the passphrase or with another,
+  read with it, written here under the same cipher and read back, a
+  changed tag or a shortened file refused.
 - `transport`: every cipher and MAC seals packets of 0 to 40000 bytes that
   the other side measures from their first bytes and opens in sequence;
   a changed byte or a packet out of order does not open; every key
@@ -103,7 +133,7 @@ python3 scripts/run_tests.py --native   # also built with the C compiler
   cancel-tcpip-forward; an unknown global request refused; replies in
   order; 40 channels at once.
 
-`scripts/interop.py` runs live connections on 127.0.0.1 (150 cases):
+`scripts/interop.py` runs live connections on 127.0.0.1 (185 cases):
 goose-ssh against an OpenSSH sshd (10.3, run as the user, with DH and
 ssh-rsa enabled again), Go's x/crypto/ssh server and goose-sshd, with
 every key exchange, cipher and MAC, every host key type, Ed25519 and RSA
@@ -114,6 +144,12 @@ And port forwarding, a 1 MB file fetched twice over HTTP through each
 forward: goose-ssh's -L, -D and -R through OpenSSH sshd and goose-sshd, -L
 and -D through Go's server; OpenSSH ssh's -L, -D, -R and -R with port 0
 through goose-sshd; Go's client's direct-tcpip through goose-sshd.
+And protected keys, the passphrase through SSH_ASKPASS: goose-ssh-keygen's
+used by goose-ssh (with OpenSSH sshd and goose-sshd) and by OpenSSH ssh,
+ssh-keygen's ChaCha20-Poly1305 and AES-GCM ones by goose-ssh, a wrong
+passphrase refused; goose-ssh-keygen's keys under every cipher read by
+ssh-keygen (and by Go, for the AES-256 CTR and CBC ones it reads), and
+its fingerprints equal to ssh-keygen's.
 
-`scripts/gossh` builds offline from the module cache
+`tools/gossh` builds offline from the module cache
 (`GOFLAGS=-mod=mod GOPROXY=off GOSUMDB=off`).

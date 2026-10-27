@@ -41,6 +41,7 @@ extern fn proc_exit(code: i32);
 
 extern fn os_user(out: u8[:]) -> i64;
 extern fn os_home(out: u8[:]) -> i64;
+extern fn os_chmod(path: const u8[:], mode: i32) -> i32;
 
 // Reads what is there (up to 64 KB) into a builder: how many bytes, 0 at
 // end of file, -1 on error.

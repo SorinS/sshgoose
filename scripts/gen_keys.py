@@ -7,14 +7,19 @@ test/vectors/keys.txt:
 
     key <name> <type> <SHA256 fingerprint> <MD5 fingerprint>
     sig <name> <algorithm> <data hex> <signature blob hex>    (by Go)
+    enc <name> <key name> <cipher> <rounds> <passphrase>      (key_<name>: key_<key name> protected)
 
-ssh-keygen gives the fingerprints; scripts/gossh (Go's x/crypto/ssh)
+The protected keys are ssh-keygen's (-p -Z cipher -a rounds), one for each
+cipher OpenSSH has for key files, and one of Go's (MarshalPrivateKeyWithPassphrase).
+
+ssh-keygen gives the fingerprints; tools/gossh (Go's x/crypto/ssh)
 signs. Go builds offline from the module cache.
 
     python3 scripts/gen_keys.py
 """
 
 import os
+import shutil
 import subprocess
 import tempfile
 
@@ -37,6 +42,22 @@ KEYS = [
     ("ed25519_pkcs8", ["-algorithm", "ed25519"], "OPENSSL"),
 ]
 
+# name, key, cipher, rounds (ssh-keygen's default is 16; fewer keep the tests quick)
+ENCRYPTED = [
+    ("ed25519_aes256ctr", "ed25519", "aes256-ctr", 16),
+    ("ed25519_aes192ctr", "ed25519", "aes192-ctr", 2),
+    ("ed25519_aes128ctr", "ed25519", "aes128-ctr", 2),
+    ("ed25519_aes256cbc", "ed25519", "aes256-cbc", 2),
+    ("ed25519_aes192cbc", "ed25519", "aes192-cbc", 2),
+    ("ed25519_aes128cbc", "ed25519", "aes128-cbc", 2),
+    ("ed25519_aes256gcm", "ed25519", "aes256-gcm@openssh.com", 2),
+    ("ed25519_aes128gcm", "ed25519", "aes128-gcm@openssh.com", 2),
+    ("ed25519_chacha", "ed25519", "chacha20-poly1305@openssh.com", 2),
+    ("ecdsa384_enc", "ecdsa384", "aes256-ctr", 3),
+    ("rsa2048_enc", "rsa2048", "aes256-gcm@openssh.com", 1),
+]
+PASSPHRASE = "correct horse"
+
 SIG_ALGS = {"ssh-ed25519": ["ssh-ed25519"], "ecdsa-sha2-nistp256": ["ecdsa-sha2-nistp256"],
             "ecdsa-sha2-nistp384": ["ecdsa-sha2-nistp384"], "ecdsa-sha2-nistp521": ["ecdsa-sha2-nistp521"],
             "ssh-rsa": ["rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"]}
@@ -50,7 +71,7 @@ def main():
     os.makedirs(VEC, exist_ok=True)
     tmp = tempfile.mkdtemp()
     gobin = os.path.join(tmp, "gossh")
-    run(["go", "build", "-o", gobin, "."], cwd=os.path.join(ROOT, "scripts", "gossh"), env=GO_ENV)
+    run(["go", "build", "-o", gobin, "."], cwd=os.path.join(ROOT, "tools", "gossh"), env=GO_ENV)
     lines = []
     data = b"the data signed for ssh.keys' tests".hex()
     for name, args, fmt in KEYS:
@@ -81,6 +102,16 @@ def main():
         for alg in SIG_ALGS[ktype]:
             sig = run([gobin, "sign", path, alg, data]).strip()
             lines.append(f"sig {name} {alg} {data} {sig}")
+    for name, base, cipher, rounds in ENCRYPTED:
+        path = os.path.join(VEC, f"key_{name}")
+        shutil.copyfile(os.path.join(VEC, f"key_{base}"), path)
+        os.chmod(path, 0o600)
+        run(["ssh-keygen", "-q", "-p", "-P", "", "-N", PASSPHRASE, "-Z", cipher, "-a", str(rounds), "-f", path])
+        lines.append(f"enc {name} {base} {cipher} {rounds} {PASSPHRASE.replace(' ', '+')}")
+    path = os.path.join(VEC, "key_rsa3072_go")
+    with open(path, "w") as f:
+        f.write(run([gobin, "encrypt", os.path.join(VEC, "key_rsa3072"), PASSPHRASE, "test rsa3072_go"]))
+    lines.append(f"enc rsa3072_go rsa3072 aes256-ctr 16 {PASSPHRASE.replace(' ', '+')}")
     with open(os.path.join(VEC, "keys.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"{len(lines)} lines")

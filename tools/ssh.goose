@@ -5,7 +5,8 @@
 //             [-D [bind:]port]... [-N] [user@]host [command...]
 //
 // It logs in with the keys given with -i (by default ~/.ssh/id_ed25519,
-// id_ecdsa and id_rsa, where they are and are not encrypted) and, when the
+// id_ecdsa and id_rsa, where they are; for a protected key the passphrase
+// is asked for, on the terminal or from $SSH_ASKPASS) and, when the
 // server takes one and no key worked, a password typed at the terminal.
 // The host key is checked against ~/.ssh/known_hosts (-o
 // UserKnownHostsFile=path); an unknown host is put to the user and added
@@ -103,17 +104,29 @@ fn parse_forward(kind: u8, spec: const u8[:]) -> u8[>..] {
     return parts;
 }
 
-// Adds a key file; false if it is not there or not usable (encrypted ones
-// are not yet).
+// Adds a key file; false if it is not there or not usable. For a
+// protected one the passphrase is asked for (on the terminal, or from
+// $SSH_ASKPASS) up to three times, as ssh does; an empty answer skips it.
 fn load_key(cfg: ssh::ClientConfig&, path: const u8[:], required: bool) -> bool {
     var text: u8[>..] = [];
     if !read_file(path, text) {
         if required { sysnet::eprint(str("goose-ssh: cannot read ", path, "\n")); }
         return false;
     }
-    let k, e = ssh::parse_private_key(text);
+    var k, e = ssh::parse_private_key(text);
+    var tries = 0;
+    while (e == ssh::KEY_ENCRYPTED || e == ssh::KEY_BAD_PASSPHRASE) && tries < 3 {
+        if e == ssh::KEY_BAD_PASSPHRASE { sysnet::eprint("Bad passphrase, try again.\n"); }
+        let pass = sysnet::secret(str("Enter passphrase for key '", path, "': "));
+        if pass.len == 0 { return false; }
+        let k2, e2 = ssh::parse_private_key(text, pass);
+        k = k2;
+        e = e2;
+        tries++;
+    }
     if e != ssh::KEY_OK {
-        let why: const u8[:] = if e == ssh::KEY_ENCRYPTED { "encrypted keys are not supported yet" } else { "not a usable key" };
+        let why: const u8[:] = if e == ssh::KEY_BAD_PASSPHRASE { "bad passphrase" }
+                               else if e == ssh::KEY_ENCRYPTED { "no passphrase given" } else { "not a usable key" };
         sysnet::eprint(str("goose-ssh: ", path, ": ", why, "\n"));
         return false;
     }

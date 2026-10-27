@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Live SSH interop over 127.0.0.1: this package's client (tools/ssh.goose,
 goose-ssh) and server (tools/sshd.goose, goose-sshd) against OpenSSH's sshd
-and ssh, Go's x/crypto/ssh (scripts/gossh), and each other.
+and ssh, Go's x/crypto/ssh (tools/gossh), and each other.
 
-It builds goose-ssh, goose-sshd and gossh, makes host and user keys with
+It builds goose-ssh, goose-sshd, goose-ssh-keygen and gossh, makes host and user keys with
 ssh-keygen, and starts three servers on free ports: an OpenSSH sshd running
 as this user (its own config, DH and ssh-rsa enabled again, since OpenSSH
 10 no longer offers them), goose-sshd, and Go's. Then:
@@ -17,6 +17,12 @@ as this user (its own config, DH and ssh-rsa enabled again, since OpenSSH
   and RSA keys, password and keyboard-interactive (through SSH_ASKPASS), a
   pty, 5 MB through cat, exit status;
 - Go's client to goose-sshd: key exchanges, ciphers, a password.
+- Passphrase-protected keys (the passphrase through SSH_ASKPASS):
+  goose-ssh-keygen's used by goose-ssh with OpenSSH sshd and goose-sshd,
+  and by OpenSSH ssh; ssh-keygen's (ChaCha20-Poly1305, AES-GCM) used by
+  goose-ssh; a wrong passphrase refused; goose-ssh-keygen's under every
+  key file cipher read by ssh-keygen (and by Go, for the AES-256 CTR and
+  CBC ones it reads), its fingerprints the same as ssh-keygen's.
 - Port forwarding, a 1 MB file fetched twice over HTTP through each forward:
   goose-ssh's -L, -D (SOCKS5) and -R through OpenSSH sshd and goose-sshd,
   -L and -D through Go's server; OpenSSH ssh's -L, -D, -R and -R with port
@@ -38,6 +44,9 @@ import time
 ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 GO_ENV = {**os.environ, "GOFLAGS": "-mod=mod", "GOPROXY": "off", "GOSUMDB": "off"}
 USER = os.environ.get("USER") or os.environ.get("LOGNAME")
+PASSPHRASE = "an interop passphrase"
+KEY_FILE_CIPHERS = ["aes256-ctr", "aes192-ctr", "aes128-ctr", "aes256-cbc", "aes192-cbc", "aes128-cbc",
+                    "aes256-gcm@openssh.com", "aes128-gcm@openssh.com", "chacha20-poly1305@openssh.com"]
 
 KEXES = ["mlkem768x25519-sha256", "curve25519-sha256", "curve25519-sha256@libssh.org", "ecdh-sha2-nistp256",
          "ecdh-sha2-nistp384", "ecdh-sha2-nistp521", "diffie-hellman-group14-sha256", "diffie-hellman-group14-sha1"]
@@ -82,16 +91,25 @@ def main():
         os.environ.get("GOOSE") or shutil.which("goose") or os.path.join(ROOT, "..", "goose.git", "build", "goose")
     t = tempfile.mkdtemp()
     k = lambda name: os.path.join(t, name)
-    for tool, out in (("ssh.goose", "goose-ssh"), ("sshd.goose", "goose-sshd")):
+    for tool, out in (("ssh.goose", "goose-ssh"), ("sshd.goose", "goose-sshd"), ("keygen.goose", "goose-ssh-keygen")):
         subprocess.run([goose, "build", "-o", k(out), os.path.join(ROOT, "tools", tool)], check=True, capture_output=True)
-    subprocess.run(["go", "build", "-o", k("gossh"), "."], cwd=os.path.join(ROOT, "scripts", "gossh"), check=True,
+    subprocess.run(["go", "build", "-o", k("gossh"), "."], cwd=os.path.join(ROOT, "tools", "gossh"), check=True,
                    env=GO_ENV)
     for name, args in (("host_ed25519", ["-t", "ed25519"]), ("host_ecdsa", ["-t", "ecdsa"]),
                        ("host_rsa", ["-t", "rsa", "-b", "2048"]), ("user_ed25519", ["-t", "ed25519"]),
                        ("user_rsa", ["-t", "rsa", "-b", "2048"]), ("other_ed25519", ["-t", "ed25519"])):
         subprocess.run(["ssh-keygen", "-q", *args, "-N", "", "-f", k(name)], check=True)
+    # Protected user keys: goose-ssh-keygen's, and ssh-keygen's under two AEADs.
+    subprocess.run([k("goose-ssh-keygen"), "-t", "ed25519", "-N", PASSPHRASE, "-f", k("enc_goose")], check=True,
+                   capture_output=True)
+    for name, args in (("enc_chacha", ["-t", "ecdsa", "-Z", "chacha20-poly1305@openssh.com"]),
+                       ("enc_gcm", ["-t", "ed25519", "-Z", "aes256-gcm@openssh.com"])):
+        subprocess.run(["ssh-keygen", "-q", *args, "-N", PASSPHRASE, "-f", k(name)], check=True)
     with open(k("authorized_keys"), "w") as f:
-        f.write(open(k("user_ed25519.pub")).read() + open(k("user_rsa.pub")).read())
+        f.write("".join(open(k(n + ".pub")).read() for n in ("user_ed25519", "user_rsa", "enc_goose", "enc_chacha", "enc_gcm")))
+    with open(k("askpass_key"), "w") as f:
+        f.write(f"#!/bin/sh\necho '{PASSPHRASE}'\n")
+    os.chmod(k("askpass_key"), 0o755)
     with open(k("passwords"), "w") as f:
         f.write(f"{USER}:letmein\n")
     with open(k("askpass"), "w") as f:
@@ -123,10 +141,10 @@ def main():
         with open(k("known_hosts"), "w") as f:
             f.write("".join(known.values()))
 
-        def gssh(port, *args, key="user_ed25519", stdin=b"", kh=None):
+        def gssh(port, *args, key="user_ed25519", stdin=b"", kh=None, env=None):
             cmd = [k("goose-ssh"), "-p", str(port), "-i", k(key), "-o", f"UserKnownHostsFile={kh or k('known_hosts')}",
                    "-o", "StrictHostKeyChecking=yes", *args]
-            return run(cmd, stdin)
+            return run(cmd, stdin, env)
 
         big = os.urandom(5_000_000)
         digest = hashlib.sha256(big).hexdigest()
@@ -214,6 +232,39 @@ def main():
             check(f"Go client -> goose-sshd, {c}, RSA key", out == b"ok\nexit=0\n", (rc, out, err))
         rc, out, err = run([k("gossh"), "client", str(p_goose), USER, "-", hk, "echo ok", "letmein"])
         check("Go client -> goose-sshd, password", out == b"ok\nexit=0\n", (rc, out, err))
+
+        # Passphrase-protected keys.
+        key_env = {**os.environ, "SSH_ASKPASS": k("askpass_key"), "SSH_ASKPASS_REQUIRE": "force", "DISPLAY": "x"}
+        for port, name in ((p_openssh, "OpenSSH sshd"), (p_goose, "goose-sshd")):
+            rc, out, err = gssh(port, "127.0.0.1", "echo ok", key="enc_goose", env=key_env)
+            check(f"goose-ssh -> {name}, goose-ssh-keygen's protected key", rc == 0 and out == b"ok\n", (rc, out, err))
+        for key, what in (("enc_chacha", "chacha20-poly1305"), ("enc_gcm", "aes256-gcm")):
+            rc, out, err = gssh(p_goose, "127.0.0.1", "echo ok", key=key, env=key_env)
+            check(f"goose-ssh -> goose-sshd, ssh-keygen's {what} protected key", rc == 0 and out == b"ok\n", (rc, out, err))
+        rc, out, err = gssh(p_openssh, "127.0.0.1", "echo ok", key="enc_goose", env=env)
+        check("goose-ssh -> OpenSSH sshd, a wrong passphrase refused", rc == 255 and b"bad passphrase" in err, (rc, out, err))
+        rc, out, err = run(["ssh", "-p", str(p_goose), "-o", f"UserKnownHostsFile={k('known_hosts')}", "-o",
+                            "IdentitiesOnly=yes", "-o", "PreferredAuthentications=publickey", "-i", k("enc_goose"),
+                            "127.0.0.1", "echo ok"], b"", key_env)
+        check("OpenSSH ssh -> goose-sshd, goose-ssh-keygen's protected key", rc == 0 and out == b"ok\n", (rc, out, err))
+        for i, cipher in enumerate(KEY_FILE_CIPHERS):
+            kt = ["ed25519", "ecdsa", "rsa"][i % 3]
+            path = k(f"kf_{i}")
+            subprocess.run([k("goose-ssh-keygen"), "-t", kt, "-b", "2048" if kt == "rsa" else "256", "-N", PASSPHRASE,
+                            "-Z", cipher, "-a", "4", "-f", path], check=True, capture_output=True)
+            mine = " ".join(open(path + ".pub").read().split()[:2])
+            rc, out, err = run(["ssh-keygen", "-y", "-P", PASSPHRASE, "-f", path])
+            check(f"ssh-keygen reads goose-ssh-keygen's {kt} key under {cipher}",
+                  rc == 0 and " ".join(out.decode().split()[:2]) == mine, (rc, out, err))
+            if cipher in ("aes256-ctr", "aes256-cbc"):
+                rc, out, err = run([k("gossh"), "pub", path, PASSPHRASE])
+                check(f"Go reads goose-ssh-keygen's {kt} key under {cipher}",
+                      rc == 0 and " ".join(out.decode().split()[:2]) == mine, (rc, out, err))
+            for e in ("sha256", "md5"):
+                _, ours, _ = run([k("goose-ssh-keygen"), "-l", "-E", e, "-f", path])
+                _, theirs, _ = run(["ssh-keygen", "-l", "-E", e, "-f", path + ".pub"])
+                check(f"goose-ssh-keygen -l -E {e}, {kt}", ours.split()[:2] == theirs.split()[:2] and ours != b"",
+                      (ours, theirs))
 
         # Port forwarding: a file over HTTP through each kind of forward.
         os.makedirs(k("www"))

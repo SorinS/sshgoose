@@ -5,8 +5,10 @@
 //	    the signature blob (hex) of data by the key with that algorithm
 //	gossh verify <public key line> <data hex> <signature blob hex>
 //	    "ok" if the signature verifies, else the error
-//	gossh pub <private key file>
+//	gossh pub <private key file> [passphrase]
 //	    the key's authorized_keys line
+//	gossh encrypt <private key file> <passphrase> <comment>
+//	    the key in OpenSSH's format under the passphrase, as Go writes it
 //	gossh server <port> <host key file> <authorized_keys file> [password]
 //	    an SSH server on 127.0.0.1: prints "ready", then for each session runs
 //	    nothing but answers exec with "go ran: <command>", a line on stderr,
@@ -27,6 +29,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -145,9 +148,22 @@ func main() {
 	case "pub":
 		pem, err := os.ReadFile(os.Args[2])
 		must(err)
-		signer, err := ssh.ParsePrivateKey(pem)
+		var signer ssh.Signer
+		if len(os.Args) > 3 {
+			signer, err = ssh.ParsePrivateKeyWithPassphrase(pem, []byte(os.Args[3]))
+		} else {
+			signer, err = ssh.ParsePrivateKey(pem)
+		}
 		must(err)
 		fmt.Print(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+	case "encrypt":
+		text, err := os.ReadFile(os.Args[2])
+		must(err)
+		key, err := ssh.ParseRawPrivateKey(text)
+		must(err)
+		blk, err := ssh.MarshalPrivateKeyWithPassphrase(key, os.Args[4], []byte(os.Args[3]))
+		must(err)
+		must(pem.Encode(os.Stdout, blk))
 	case "server":
 		pem, err := os.ReadFile(os.Args[3])
 		must(err)

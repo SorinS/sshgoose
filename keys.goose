@@ -1,6 +1,7 @@
 // ssh.keys: SSH public keys and signatures (RFC 4253 §6.6, RFC 5656,
 // RFC 8332, RFC 8709) and the files keys come in: authorized_keys lines,
-// OpenSSH's private key format (openssh-key-v1) and the PEM ones x509
+// OpenSSH's private key format (openssh-key-v1, passphrase-protected or
+// not) and the PEM ones x509
 // reads (PKCS #8, PKCS #1, SEC 1), with fingerprints. The key types are
 // Ed25519, ECDSA on P-256, P-384 and P-521, and RSA, signing as
 // rsa-sha2-256, rsa-sha2-512 or (legacy) ssh-rsa; a private key is an
@@ -17,6 +18,12 @@ import bignum.ed25519;
 import bignum.rsa;
 import bignum.hmac;
 import bignum.md5;
+import bignum.aes;
+import bignum.modes;
+import bignum.gcm;
+import bignum.chacha20;
+import bignum.bcrypt;
+import bignum.ct;
 import bignum.entropy;
 import asn1;
 import x509;
@@ -396,12 +403,14 @@ let KEY_ENCRYPTED: i64 = 3;             // a passphrase is needed
 let KEY_BAD_PASSPHRASE: i64 = 4;
 
 // A private key file: OpenSSH's format ("-----BEGIN OPENSSH PRIVATE
-// KEY-----"), or PEM PKCS #8 ("PRIVATE KEY"), PKCS #1 ("RSA PRIVATE KEY")
-// or SEC 1 ("EC PRIVATE KEY"), unencrypted. KEY_OK, or why not.
-fn parse_private_key(text: const u8[:]) -> PrivateKey, i64 {
+// KEY-----"), with the passphrase if it has one, or PEM PKCS #8 ("PRIVATE
+// KEY"), PKCS #1 ("RSA PRIVATE KEY") or SEC 1 ("EC PRIVATE KEY"),
+// unencrypted. KEY_OK, or why not: KEY_ENCRYPTED for a protected key and
+// no passphrase, KEY_BAD_PASSPHRASE for the wrong one.
+fn parse_private_key(text: const u8[:], passphrase: const u8[:] = "") -> PrivateKey, i64 {
     let none = no_private_key();
     let blocks, ok = asn1::pem_decode(text, "OPENSSH PRIVATE KEY");
-    if ok && blocks.len == 1 { for blk in blocks { return parse_openssh_key(blk); } }
+    if ok && blocks.len == 1 { for blk in blocks { return parse_openssh_key(blk, passphrase); } }
     let labels: const u8[:][3] = ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"];
     for label in labels {
         let ders, okd = asn1::pem_decode(text, label);
@@ -417,10 +426,58 @@ fn parse_private_key(text: const u8[:]) -> PrivateKey, i64 {
     return none, KEY_MALFORMED;
 }
 
+// The ciphers of protected key files, as OpenSSH has them (Go reads the
+// AES-256 CTR and CBC ones): aes256-ctr is ssh-keygen's.
+let KEY_FILE_CIPHERS: const u8[:] = "aes256-ctr,aes192-ctr,aes128-ctr,aes256-cbc,aes192-cbc,aes128-cbc,aes256-gcm@openssh.com,aes128-gcm@openssh.com,chacha20-poly1305@openssh.com";
+let KEY_FILE_CIPHER: const u8[:] = "aes256-ctr";
+let KEY_FILE_ROUNDS: i64 = 16;          // ssh-keygen's bcrypt_pbkdf rounds
+
+// A key file cipher's key, IV and tag lengths and block size.
+fn key_file_cipher(name: const u8[:]) -> i64, i64, i64, i64, bool {
+    if !has_name(KEY_FILE_CIPHERS, name) { return 0, 0, 0, 0, false; }
+    if name == "chacha20-poly1305@openssh.com" { return 64, 0, 16, 8, true; }
+    let klen: i64 = if name.starts_with("aes128") { 16 } else if name.starts_with("aes192") { 24 } else { 32 };
+    if name.ends_with("-gcm@openssh.com") { return klen, 12, 16, 16, true; }
+    return klen, 16, 0, 16, true;
+}
+
+// The private section en- or decrypted in place under key || IV (as
+// OpenSSH's cipher_crypt with sequence number 0 and no AAD), returning
+// the tag, or checking it; false for a tag that does not match.
+fn key_file_crypt(name: const u8[:], kiv: const u8[:], data: u8[:], encrypt: bool, tag: u8[16]&) -> bool {
+    let klen, ivlen, taglen, bs, ok = key_file_cipher(name);
+    assert(ok && kiv.len == klen + ivlen);
+    let key = kiv[..klen];
+    let iv = kiv[klen..];
+    if name == "chacha20-poly1305@openssh.com" {
+        let nonce: u8[12] = [0; 12];
+        let poly_key = bignum::chacha20_block(key[..32], 0, nonce);
+        if !encrypt && bignum::ct_eq_bytes(bignum::poly1305(poly_key[..32], data), tag) == 0 { return false; }
+        bignum::chacha20_xor(key[..32], 1, nonce, data);
+        if encrypt { tag = bignum::poly1305(poly_key[..32], data); }
+        return true;
+    }
+    if name.ends_with("-gcm@openssh.com") {
+        let g = bignum::gcm_init(key);
+        if encrypt { tag = bignum::gcm_encrypt(g, iv, "", data); return true; }
+        return bignum::gcm_decrypt(g, iv, "", data, tag);
+    }
+    let a = bignum::aes_init(key);
+    if name.ends_with("-ctr") {
+        bignum::aes_ctr(a, iv, data);
+    } else if encrypt {
+        bignum::cbc_encrypt(a, iv, data);
+    } else {
+        bignum::cbc_decrypt(a, iv, data);
+    }
+    return true;
+}
+
 // The openssh-key-v1 structure (PROTOCOL.key): the cipher, KDF and its
-// options, one public key, and the private section with its check words,
-// the key and its comment, and padding 1, 2, 3, ...
-fn parse_openssh_key(b: const u8[:]) -> PrivateKey, i64 {
+// options, one public key, and the private section (encrypted, a tag
+// after it for an AEAD) with its check words, the key and its comment,
+// and padding 1, 2, 3, ...
+fn parse_openssh_key(b: const u8[:], passphrase: const u8[:]) -> PrivateKey, i64 {
     let none = no_private_key();
     if b.len < OPENSSH_MAGIC.len || b[..OPENSSH_MAGIC.len] != OPENSSH_MAGIC { return none, KEY_MALFORMED; }
     var r = rd_at(OPENSSH_MAGIC.len, b.len);
@@ -430,11 +487,29 @@ fn parse_openssh_key(b: const u8[:]) -> PrivateKey, i64 {
     let n = get_u32(r, b);
     let pub = get_string(r, b);
     let priv = get_string(r, b);
-    if !done(r) || n != 1 { return none, KEY_MALFORMED; }
-    if bytes(b, cipher) != "none" || bytes(b, kdf) != "none" {
-        return none, if bytes(b, kdf) == "bcrypt" { KEY_ENCRYPTED } else { KEY_UNSUPPORTED };
+    if r.bad || n != 1 { return none, KEY_MALFORMED; }
+    let cn = bytes(b, cipher);
+    if cn == "none" && bytes(b, kdf) == "none" {
+        if !done(r) { return none, KEY_MALFORMED; }
+        return parse_openssh_private(b, priv, bytes(b, pub));
     }
-    return parse_openssh_private(b, priv, bytes(b, pub));
+    let klen, ivlen, taglen, bs, okc = key_file_cipher(cn);
+    if bytes(b, kdf) != "bcrypt" || !okc { return none, if cn == "none" || bytes(b, kdf) == "none" { KEY_MALFORMED } else { KEY_UNSUPPORTED }; }
+    var o = kdf_opts;
+    let salt = get_string(o, b);
+    let rounds = get_u32(o, b);
+    if !done(o) || salt.pos == salt.end || rounds == 0 || (priv.end - priv.pos) % bs != 0 || r.end - r.pos != taglen {
+        return none, KEY_MALFORMED;
+    }
+    if passphrase.len == 0 { return none, KEY_ENCRYPTED; }
+    let kiv, okk = bignum::bcrypt_pbkdf(passphrase, bytes(b, salt), rounds as i64, klen + ivlen);
+    if !okk { return none, KEY_MALFORMED; }
+    var dec: u8[>..] = [];
+    dec.append(bytes(b, priv));
+    var tag: u8[16] = [0; 16];
+    for i in taglen { tag[i] = b[r.pos + i]; }
+    if !key_file_crypt(cn, kiv, dec, false, tag) { return none, KEY_BAD_PASSPHRASE; }
+    return parse_openssh_private(dec, rd(dec), bytes(b, pub));
 }
 
 fn parse_openssh_private(b: const u8[:], priv: Rd, pub_blob: const u8[:]) -> PrivateKey, i64 {
@@ -490,13 +565,30 @@ fn parse_openssh_private(b: const u8[:], priv: Rd, pub_blob: const u8[:]) -> Pri
     return k, KEY_OK;
 }
 
-// A key in OpenSSH's format, unencrypted, as ssh-keygen writes it.
-fn marshal_private_key(k: const PrivateKey&) -> u8[>..] {
+// A key in OpenSSH's format as ssh-keygen writes it: unencrypted, or with
+// a passphrase under a key file cipher and bcrypt_pbkdf with a random
+// 16-byte salt and this many rounds.
+fn marshal_private_key(k: const PrivateKey&, passphrase: const u8[:] = "", cipher: const u8[:] = KEY_FILE_CIPHER,
+                       rounds: i64 = KEY_FILE_ROUNDS) -> u8[>..] {
+    let klen, ivlen, taglen, bs0, okc = key_file_cipher(cipher);
+    assert(passphrase.len == 0 || (okc && rounds >= 1));
+    let bs = if passphrase.len > 0 { bs0 } else { 8 };
+    var salt: u8[16] = [0; 16];
     var b: u8[>..] = [];
     b.append(OPENSSH_MAGIC);
-    put_string(b, "none");
-    put_string(b, "none");
-    put_string(b, "");
+    if passphrase.len > 0 {
+        bignum::random_bytes(salt);
+        put_string(b, cipher);
+        put_string(b, "bcrypt");
+        let mark = begin_string(b);
+        put_string(b, salt);
+        put_u32(b, rounds as! u32);
+        end_string(b, mark);
+    } else {
+        put_string(b, "none");
+        put_string(b, "none");
+        put_string(b, "");
+    }
     put_u32(b, 1);
     put_string(b, k.public.blob);
     var p: u8[>..] = [];
@@ -525,8 +617,16 @@ fn marshal_private_key(k: const PrivateKey&) -> u8[>..] {
     }
     put_string(p, k.comment);
     var i: u8 = 1;
-    while p.len % 8 != 0 { p.push(i); i++; }
-    put_string(b, p);
+    while p.len % bs != 0 { p.push(i); i++; }
+    if passphrase.len > 0 {
+        let kiv, okk = bignum::bcrypt_pbkdf(passphrase, salt, rounds, klen + ivlen);
+        var tag: u8[16] = [0; 16];
+        let x = key_file_crypt(cipher, kiv, p, true, tag);
+        put_string(b, p);
+        b.append(tag[..taglen]);
+    } else {
+        put_string(b, p);
+    }
     var out: u8[>..] = [];
     out.append("-----BEGIN OPENSSH PRIVATE KEY-----\n");
     var text: u8[>..] = [];
