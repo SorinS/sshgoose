@@ -209,6 +209,21 @@ fn negotiate(client: const u8[:], server: const u8[:]) -> u8[>..] {
     return out;
 }
 
+// The names of a list that are also in another, in the first list's order:
+// a configured list cut down to what this package implements, as Go's
+// SetDefaults does, so that it never offers a name it can't use.
+fn supported_names(list: const u8[:], supported: const u8[:]) -> u8[>..] {
+    var out: u8[>..] = [];
+    var i = 0;
+    while i < list.len {
+        var j = i;
+        while j < list.len && list[j] != ',' { j++; }
+        if j > i && has_name(supported, list[i..j]) { add_name(out, list[i..j]); }
+        i = j + 1;
+    }
+    return out;
+}
+
 // The first name of a list.
 fn first_name(list: const u8[:]) -> u8[>..] {
     var j = 0;

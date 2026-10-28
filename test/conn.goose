@@ -234,6 +234,27 @@ fn algorithms() {
         let r = connect(cc, sc, false);
         check(str("host key ", h), r.ok);
     }
+    // Names this package lacks, first on both sides, are not offered: the
+    // next one is used. With only those, the MAC is refused (it used to
+    // be chosen, and failed an assert).
+    for only in 2 {
+        var cc = client_cfg();
+        let ed = ed25519_key();
+        let a = ssh::add_key(cc, ed);
+        var sc = server_cfg();
+        sc.authorized_keys.append(ssh::marshal_authorized_key(ed.public));
+        cc.kex.clear(); cc.kex.append("diffie-hellman-group-exchange-sha256,curve25519-sha256");
+        cc.ciphers.clear(); cc.ciphers.append("aes128-cbc,aes128-ctr");
+        cc.macs.clear(); cc.macs.append("hmac-sha1-etm@openssh.com,umac-64-etm@openssh.com");
+        if only == 0 { cc.macs.append(",hmac-sha2-256"); }
+        cc.host_key_algs.clear(); cc.host_key_algs.append("ssh-dss,ssh-ed25519");
+        sc.kex.clear(); sc.kex.append(cc.kex);
+        sc.ciphers.clear(); sc.ciphers.append(cc.ciphers);
+        sc.macs.clear(); sc.macs.append(cc.macs);
+        let r = connect(cc, sc, true);
+        if only == 0 { check("unsupported names skipped", r.ok); }
+        else { check("only unsupported MACs refused", !r.ok && r.msg == "no common MAC"); }
+    }
 }
 
 fn authentication() {

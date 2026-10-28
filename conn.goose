@@ -369,7 +369,7 @@ fn client_host_key_algs(cfg: const ClientConfig&) -> u8[>..] {
         var j = i;
         while j < list.len && list[j] != ',' { j++; }
         let alg = list[i..j];
-        if j > i {
+        if j > i && has_name(HOST_KEY_ALGS, alg) {
             if cfg.host_key_check == HOST_KEY_KNOWN_HOSTS && known_kind(cfg, kind_of_sig(alg)) { add_name(known, alg); }
             else { add_name(other, alg); }
         }
@@ -386,17 +386,16 @@ fn send_kexinit(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, 
     bignum::random_bytes(cookie);
     b.append(cookie);
     // The kex list carries the extension and strict-kex markers on the
-    // first exchange only.
-    var kexl: u8[>..] = [];
-    kexl.append(if c.is_server { scfg.kex[..] } else { ccfg.kex[..] });
+    // first exchange only. Each list offers only what this package has.
+    var kexl = supported_names(if c.is_server { scfg.kex[..] } else { ccfg.kex[..] }, KEX_SUPPORTED);
     if c.kex_count == 0 {
         add_name(kexl, if c.is_server { "ext-info-s" } else { "ext-info-c" });
         add_name(kexl, if c.is_server { "kex-strict-s-v00@openssh.com" } else { "kex-strict-c-v00@openssh.com" });
     }
     put_string(b, kexl);
     if c.is_server { put_string(b, server_host_key_algs(scfg)); } else { put_string(b, client_host_key_algs(ccfg)); }
-    let ciphers = if c.is_server { scfg.ciphers[..] } else { ccfg.ciphers[..] };
-    let macs = if c.is_server { scfg.macs[..] } else { ccfg.macs[..] };
+    let ciphers = supported_names(if c.is_server { scfg.ciphers[..] } else { ccfg.ciphers[..] }, CIPHERS);
+    let macs = supported_names(if c.is_server { scfg.macs[..] } else { ccfg.macs[..] }, MACS);
     put_string(b, ciphers);
     put_string(b, ciphers);
     put_string(b, macs);
