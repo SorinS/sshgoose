@@ -31,7 +31,8 @@ server, and `goose-ssh-keygen` (see below).
   bytes that arrive, get the bytes to send and a stream of events. Version
   exchange, negotiation, strict key exchange (Terrapin), server-sig-algs
   (RFC 8308), rekeying (on request, after `rekey_bytes` sent or received,
-  1 GB by default, or 2^31 packets either way, as Go; past 2^32 − 2 packets
+  1 GB by default, or 2^31 packets either way, as Go, checked as each
+  packet goes out and as input comes in; past 2^32 − 2 packets
   under one key, where ChaCha20-Poly1305's nonce would repeat, the
   connection fails; between its KEXINIT and its NEWKEYS a side sends only
   the exchange's messages, RFC 4253 §7.1, and what else it has waits and
@@ -142,14 +143,15 @@ on free ports of 127.0.0.1, and leaves nothing running.
   rekeying on bytes received alone and on the packet count, and the
   connection failed at the packet limit, sending and receiving; a held
   window that lets in one window and then only what was used; window
-  adjustments wanted during either side's rekey held until its NEWKEYS.
+  adjustments wanted during either side's rekey held until its NEWKEYS;
+  a rekey started by sending alone (global requests, no input).
 - `forward`: port forwarding in memory: direct-tcpip with its target and
   originator, data, EOF and close, and a refused one; tcpip-forward on port
   0 and the port in the reply; forwarded-tcpip channels from the server;
   cancel-tcpip-forward; an unknown global request refused; replies in
   order; 40 channels at once.
 
-`scripts/interop.py` runs live connections on 127.0.0.1 (192 cases):
+`scripts/interop.py` runs live connections on 127.0.0.1 (193 cases):
 goose-ssh against an OpenSSH sshd (10.3, run as the user, with DH and
 ssh-rsa enabled again), Go's x/crypto/ssh server and goose-sshd, with
 every key exchange, cipher and MAC, every host key type, Ed25519 and RSA

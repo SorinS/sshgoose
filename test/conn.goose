@@ -621,6 +621,26 @@ fn rekey_accounting() {
         check("received packets rekey", n == 8 && p.s.kex_count == n0 + 1 && p.s.rx_packets < 100);
         sc.rekey_bytes = 1073741824;
     }
+    // Sending alone: global requests and no input at all start a rekey at
+    // once, with the lists the first exchange kept.
+    {
+        var cs = copy(cc);
+        cs.rekey_bytes = 200;
+        var w = seen();
+        var p = connected(cs, sc, w);
+        var to_server: u8[>..] = [];
+        var to_client: u8[>..] = [];
+        let n0 = p.c.kex_count;
+        var started = false;
+        for i in 10 {
+            let ok = ssh::global_request(p.c, "keepalive@goose", false, "", to_server);
+            if p.c.in_kex { started = true; break; }
+        }
+        check("send-only rekey starts", started && p.c.sent_kexinit);
+        pump(p.c, cs, p.s, sc, to_server, to_client, w);
+        check("send-only rekey completes", !ssh::failed(p.c) && !ssh::failed(p.s) && p.c.kex_count == n0 + 1 &&
+              p.s.kex_count == n0 + 1 && !p.c.in_kex);
+    }
     // At MAX_PACKETS under one key, sending stops and the connection
     // fails; receiving one more fails it too.
     {

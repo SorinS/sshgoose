@@ -476,13 +476,33 @@ int64_t os_user(net_buf out) {
     return (int64_t)l;
 }
 
-/* The permission bits of a file (stat(2)), or -1 when it is not there or
-   cannot be looked at. */
-int32_t os_file_mode(net_slice path) {
+/* Reads a private file in one open: not through a symlink (O_NOFOLLOW),
+   and then checked on the descriptor itself (fstat), so nothing can be
+   swapped in between: a regular file, owned by this user, that no one else
+   may read or write. Its length into out, or -1 when it is not there, -2
+   when it cannot be opened, -3 not a regular file, -4 owned by another
+   user, -5 group or others have access, -6 too long or unreadable. */
+int64_t os_read_private(net_slice path, net_buf out) {
     char p[4096];
+    if (cstring(path, p, sizeof p) < 0) return -2;
+    int fd = open(p, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? -1 : -2;
     struct stat st;
-    if (cstring(path, p, sizeof p) < 0 || stat(p, &st) < 0) return -1;
-    return (int32_t)(st.st_mode & 07777);
+    int64_t r = 0;
+    if (fstat(fd, &st) < 0) r = -2;
+    else if (!S_ISREG(st.st_mode)) r = -3;
+    else if (st.st_uid != geteuid()) r = -4;
+    else if ((st.st_mode & 077) != 0) r = -5;
+    else if (st.st_size > out.len) r = -6;
+    while (r >= 0 && r < out.len) {
+        ssize_t n = read(fd, out.data + r, (size_t)(out.len - r));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { r = -6; break; }
+        if (n == 0) break;
+        r += n;
+    }
+    close(fd);
+    return r;
 }
 
 static int write_all(int fd, net_slice data) {

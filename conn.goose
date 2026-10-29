@@ -206,6 +206,8 @@ struct Conn {
     message: u8[..256],               // what went wrong
     my_version: u8[..255], peer_version: u8[..255],
     my_kexinit: u8[..4096], peer_kexinit: u8[..8192],
+    rekey_lists: u8[..4096],          // our KEXINIT after its cookie, as a rekey sends it (send_packet's rekeys)
+    rekey_bytes: i64,                 // the configuration's rekey_bytes
     // The negotiated algorithms.
     kex_name: u8[..64], host_key_alg: u8[..64], cipher_c2s: u8[..64], cipher_s2c: u8[..64],
     mac_c2s: u8[..64], mac_s2c: u8[..64],
@@ -236,7 +238,7 @@ fn new_conn(is_server: bool) -> Conn {
     let kx, ok = kex_method("curve25519-sha256");
     var c = Conn {
         is_server: is_server, state: ST_VERSION, reason: 0, message: [], my_version: [], peer_version: [],
-        my_kexinit: [], peer_kexinit: [], kex_name: [], host_key_alg: [], cipher_c2s: [], cipher_s2c: [],
+        my_kexinit: [], peer_kexinit: [], rekey_lists: [], rekey_bytes: 0, kex_name: [], host_key_alg: [], cipher_c2s: [], cipher_s2c: [],
         mac_c2s: [], mac_s2c: [], kx: kx, session_id: [], host_key: no_public_key(), strict: false,
         peer_ext_info: false, server_sig_algs: [], in_kex: false, sent_kexinit: false, sent_newkeys: false,
         kex_count: 0, ignore_next: false, tx: no_cipher(), rx: no_cipher(), tx_next: no_cipher(), rx_next: no_cipher(),
@@ -251,6 +253,7 @@ fn new_conn(is_server: bool) -> Conn {
 fn client(cfg: const ClientConfig&) -> Conn {
     var c = new_conn(false);
     c.my_version.append(cfg.version);
+    c.rekey_bytes = cfg.rekey_bytes;
     c.user.append(cfg.user);
     c.password.append(cfg.password);
     c.has_password = cfg.has_password;
@@ -260,6 +263,7 @@ fn client(cfg: const ClientConfig&) -> Conn {
 fn server(cfg: const ServerConfig&) -> Conn {
     var c = new_conn(true);
     c.my_version.append(cfg.version);
+    c.rekey_bytes = cfg.rekey_bytes;
     return c;
 }
 
@@ -333,6 +337,9 @@ fn send_packet(c: Conn&, payload: const u8[:], out: u8[>..]&) {
         return;
     }
     seal_out(c, payload, out);
+    // Sending alone can make a rekey due: it starts here, with the lists
+    // the first exchange kept, not only when input next comes.
+    if rekey_due(c) && c.rekey_lists.len > 0 { send_kexinit_lists(c, c.rekey_lists, out); }
 }
 
 // A packet under the current keys, counted; none past MAX_PACKETS.
@@ -453,15 +460,21 @@ fn client_host_key_algs(cfg: const ClientConfig&) -> u8[>..] {
 }
 
 fn send_kexinit(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, out: u8[>..]&) {
-    var b: u8[>..] = [];
-    b.push(MSG_KEXINIT);
-    var cookie: u8[16] = [0; 16];
-    bignum::random_bytes(cookie);
-    b.append(cookie);
     // The kex list carries the extension and strict-kex markers on the
     // first exchange only. Each list offers only what this package has.
+    // What a rekey sends (no markers) is kept, for send_packet's.
+    let first = c.kex_count == 0;
+    let lists = kexinit_lists(c, ccfg, scfg, first);
+    if first { c.rekey_lists = kexinit_lists(c, ccfg, scfg, false); } else { c.rekey_lists = lists; }
+    send_kexinit_lists(c, lists, out);
+}
+
+// A KEXINIT's name-lists, guess flag and reserved word: all of it after the
+// cookie.
+fn kexinit_lists(c: const Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, markers: bool) -> u8[..4096] {
+    var b: u8[>..] = [];
     var kexl = supported_names(if c.is_server { scfg.kex[..] } else { ccfg.kex[..] }, KEX_SUPPORTED);
-    if c.kex_count == 0 {
+    if markers {
         add_name(kexl, if c.is_server { "ext-info-s" } else { "ext-info-c" });
         add_name(kexl, if c.is_server { "kex-strict-s-v00@openssh.com" } else { "kex-strict-c-v00@openssh.com" });
     }
@@ -479,11 +492,32 @@ fn send_kexinit(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, 
     put_string(b, "");
     put_bool(b, false);
     put_u32(b, 0);
+    var out: u8[..4096] = [];
+    out.append(b);
+    return out;
+}
+
+// Sends a KEXINIT: a fresh cookie, then these lists.
+fn send_kexinit_lists(c: Conn&, lists: const u8[:], out: u8[>..]&) {
+    var b: u8[>..] = [];
+    b.push(MSG_KEXINIT);
+    var cookie: u8[16] = [0; 16];
+    bignum::random_bytes(cookie);
+    b.append(cookie);
+    b.append(lists);
     c.my_kexinit.clear();
     c.my_kexinit.append(b);
-    send_packet(c, b, out);
+    seal_out(c, b, out);
     c.sent_kexinit = true;
     c.in_kex = true;
+}
+
+// Whether a rekey is due: rekey_bytes sent or received (0: never), or
+// REKEY_PACKETS either way.
+fn rekey_due(c: const Conn&) -> bool {
+    if c.state != ST_CONNECTED || c.in_kex { return false; }
+    let by_bytes = c.rekey_bytes > 0 && (c.tx_bytes >= c.rekey_bytes || c.rx_bytes >= c.rekey_bytes);
+    return by_bytes || c.tx_packets >= REKEY_PACKETS || c.rx_packets >= REKEY_PACKETS;
 }
 
 // A rekey: a new KEXINIT; the exchange then runs as the first did, under
@@ -1844,13 +1878,9 @@ fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: c
         }
         // Rekey once enough has gone either way, in bytes (rekey_bytes, 0
         // for never) or packets (as Go: counted both ways, sent and
-        // received, as RFC 4253 §9 asks). Checked here, as input comes: an
-        // application that only sends still gets the peer's window
-        // adjustments, so it overshoots by a window at most.
-        let limit = if c.is_server { scfg.rekey_bytes } else { ccfg.rekey_bytes };
-        let by_bytes = limit > 0 && (c.tx_bytes >= limit || c.rx_bytes >= limit);
-        let by_packets = c.tx_packets >= REKEY_PACKETS || c.rx_packets >= REKEY_PACKETS;
-        if c.state == ST_CONNECTED && !c.in_kex && (by_bytes || by_packets) {
+        // received, as RFC 4253 §9 asks): here for what came in;
+        // send_packet does the same for what goes out.
+        if rekey_due(c) {
             let ok = rekey(c, ccfg, scfg, out);
         }
         // Held for the application, or nothing more to do with what came.

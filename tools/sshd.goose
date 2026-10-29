@@ -41,20 +41,26 @@ fn usage() {
 }
 
 // A host key from its file, or a new Ed25519 one written there, mode
-// 0600. As in OpenSSH, a key file others may read is refused, and one
-// that is there but cannot be read is an error, not a reason for a new key.
+// 0600. As in OpenSSH, a key file others may read is refused; so are one
+// that is a symlink, not a regular file or another user's, all checked on
+// the open file itself (os_read_private). One that is there but cannot be
+// read is an error, not a reason for a new key.
 fn host_key(path: const u8[:]) -> ssh::PrivateKey {
-    let mode = sysnet::os_file_mode(path);
-    if mode >= 0 {
-        if mode & 63 != 0 {                                 // 077
-            sysnet::eprint(str("goose-sshd: ", path, ": permissions are too open (others may read it)\n"));
+    var buf: u8[>..] = [];
+    buf.resize(65536, 0);
+    let n = sysnet::os_read_private(path, buf);
+    if n != -1 {
+        if n < 0 {
+            let why = if n == -5 { "permissions are too open (others may read it)" }
+                      else if n == -4 { "owned by another user" }
+                      else if n == -3 { "not a regular file" }
+                      else if n == -6 { "cannot be read, or too long" }
+                      else { "cannot be opened (a symlink?)" };
+            sysnet::eprint(str("goose-sshd: ", path, ": ", why, "\n"));
             exit(1);
         }
         var text: u8[>..] = [];
-        if !read_file(path, text) {
-            sysnet::eprint(str("goose-sshd: cannot read ", path, "\n"));
-            exit(1);
-        }
+        text.append(buf[..n]);
         let k, e = ssh::parse_private_key(text);
         if e != ssh::KEY_OK {
             sysnet::eprint(str("goose-sshd: ", path, ": not a usable host key\n"));
@@ -156,6 +162,16 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
             ssh::channel_consumed(c, s.ch, took, out);
             if s.in_pos == s.pending_in.len {
                 s.pending_in.clear();
+                s.in_pos = 0;
+            } else if s.in_pos >= 1048576 && 2 * s.in_pos >= s.pending_in.len {
+                // What the child took goes, or the buffer would keep every
+                // byte of a stream the child never quite catches up with:
+                // it stays within two windows, each byte copied at most
+                // once more.
+                var rest: u8[>..] = [];
+                rest.append(s.pending_in[s.in_pos..]);
+                s.pending_in.clear();
+                s.pending_in.append(rest);
                 s.in_pos = 0;
             }
         }

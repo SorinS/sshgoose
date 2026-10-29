@@ -157,6 +157,10 @@ def main():
     rc, _, err = run([k("goose-sshd"), "-p", str(free_port()), "-h", k("open_host"), "-k", k("authorized_keys")],
                      timeout=30)
     check("sshd: a host key others may read is refused", rc != 0 and b"too open" in err, err.decode())
+    os.symlink(k("host_ed25519"), k("linked_host"))
+    rc, _, err = run([k("goose-sshd"), "-p", str(free_port()), "-h", k("linked_host"), "-k", k("authorized_keys")],
+                     timeout=30)
+    check("sshd: a host key through a symlink is refused", rc != 0 and b"symlink" in err, err.decode())
 
     # The three servers.
     p_openssh, p_goose, p_go = free_port(), free_port(), free_port()
