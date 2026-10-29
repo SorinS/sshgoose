@@ -30,12 +30,17 @@ server, and `goose-ssh-keygen` (see below).
 - **`ssh.conn`**: connections, client and server, without I/O: feed in the
   bytes that arrive, get the bytes to send and a stream of events. Version
   exchange, negotiation, strict key exchange (Terrapin), server-sig-algs
-  (RFC 8308), rekeying; the host key against known_hosts lines (patterns,
+  (RFC 8308), rekeying (on request, after `rekey_bytes` sent or received,
+  1 GB by default, or 2^31 packets either way, as Go; past 2^32 − 2 packets
+  under one key, where ChaCha20-Poly1305's nonce would repeat, the
+  connection fails); the host key against known_hosts lines (patterns,
   hashed entries, ports, @revoked), a fixed key, or put to the application;
   publickey (query, then signature; the server refuses authorized_keys
   lines with options, which it does not enforce), password and keyboard-interactive
   authentication both ways, the client asking for a password only when it
-  needs one; channels with flow control, data and stderr, exec, shell,
+  needs one; channels with flow control (the window opens as data
+  arrives, or, held with `channel_hold_window`, as the application reports
+  it used with `channel_consumed`, as Go's channels do as they are read), data and stderr, exec, shell,
   pty-req, env, subsystem, window-change, exit-status and exit-signal;
   global requests and their replies, and port forwarding's channels and
   requests (direct-tcpip, tcpip-forward, cancel-tcpip-forward,
@@ -131,7 +136,10 @@ on free ports of 127.0.0.1, and leaves nothing running.
   MAC and host key type; each kind of login, refused ones, a password
   asked for; every known_hosts case and the ask mode, which sends nothing
   until the host key is accepted; sessions with exec, env and pty, 3 MB
-  each way through the windows, rekeys from both sides, disconnect.
+  each way through the windows, rekeys from both sides, disconnect;
+  rekeying on bytes received alone and on the packet count, and the
+  connection failed at the packet limit, sending and receiving; a held
+  window that lets in one window and then only what was used.
 - `forward`: port forwarding in memory: direct-tcpip with its target and
   originator, data, EOF and close, and a refused one; tcpip-forward on port
   0 and the port in the reply; forwarded-tcpip channels from the server;

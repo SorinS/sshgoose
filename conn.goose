@@ -14,8 +14,9 @@
 // first_kex_packet_follows), the key exchanges of ssh.kex, the host key
 // checked against known_hosts lines (hashed ones too) or a fixed key,
 // strict key exchange (kex-strict-*-v00@openssh.com, against Terrapin),
-// server-sig-algs (RFC 8308), and rekeying on request or after
-// rekey_bytes. Authentication: publickey (a query, then the signature),
+// server-sig-algs (RFC 8308), and rekeying on request, after rekey_bytes
+// sent or received, or after 2^31 packets either way; past 2^32 - 2
+// packets under one key the connection fails. Authentication: publickey (a query, then the signature),
 // password and keyboard-interactive, both sides; the server checks keys
 // against authorized_keys and passwords against its table (plain or
 // bcrypt). Channels: sessions and any other type the application accepts,
@@ -176,14 +177,18 @@ fn add_host_key(cfg: ServerConfig&, k: const PrivateKey&) -> bool {
 // both ways (what we still take, what the peer still takes), the largest
 // packet the peer takes, its type, how far its close has gone, and how
 // many of the peer's requests await a reply.
+// held: the window opens again only as the application says it has used
+// the data (channel_consumed), not as the data arrives; consumed counts
+// what it has used since the last WINDOW_ADJUST.
 struct Channel {
     state: i64, remote: u32, in_window: u32, out_window: u32, out_max: u32,
     sent_eof: bool, sent_close: bool, recv_eof: bool, recv_close: bool, replies: i64,
+    held: bool, consumed: u32,
 }
 
 fn free_channel() -> Channel {
     Channel { state: CH_FREE, remote: 0, in_window: 0, out_window: 0, out_max: 0, sent_eof: false, sent_close: false,
-              recv_eof: false, recv_close: false, replies: 0 }
+              recv_eof: false, recv_close: false, replies: 0, held: false, consumed: 0 }
 }
 
 // Authentication's steps, on the client.
@@ -211,7 +216,8 @@ struct Conn {
     in_kex: bool, sent_kexinit: bool, sent_newkeys: bool, kex_count: i64,
     ignore_next: bool,                // the peer guessed its first kex packet wrong
     tx: PacketCipher, rx: PacketCipher, tx_next: PacketCipher, rx_next: PacketCipher,
-    bytes_since_kex: i64,
+    tx_bytes: i64, tx_packets: i64,        // sent under the current keys
+    rx_bytes: i64, rx_packets: i64,        // received under the current keys
     user: u8[..255],
     auth_step: i64, key_index: i64, password_tried: bool, kbd_tried: bool, auth_tries: i64, kbd_pending: bool,
     banner_sent: bool,
@@ -233,7 +239,7 @@ fn new_conn(is_server: bool) -> Conn {
         mac_c2s: [], mac_s2c: [], kx: kx, session_id: [], host_key: no_public_key(), strict: false,
         peer_ext_info: false, server_sig_algs: [], in_kex: false, sent_kexinit: false, sent_newkeys: false,
         kex_count: 0, ignore_next: false, tx: no_cipher(), rx: no_cipher(), tx_next: no_cipher(), rx_next: no_cipher(),
-        bytes_since_kex: 0, user: [], auth_step: AUTH_NONE, key_index: 0, password_tried: false, kbd_tried: false,
+        tx_bytes: 0, tx_packets: 0, rx_bytes: 0, rx_packets: 0, user: [], auth_step: AUTH_NONE, key_index: 0, password_tried: false, kbd_tried: false,
         auth_tries: 0, kbd_pending: false, banner_sent: false, password: [], has_password: false, host_key_wait: false, held_k: [], held_h: [],
         auth_methods: [], global_replies: 0, channels: [], inbuf: [],
     };
@@ -287,9 +293,28 @@ fn next_event(events: const u8[:], pos: i64&) -> Event, bool {
 
 // --- Sending ----------------------------------------------------------------------
 
+// Packets under one key, each direction: a rekey starts at REKEY_PACKETS
+// whatever rekey_bytes says (Go's packetRekeyThreshold), and the
+// connection fails rather than go past MAX_PACKETS, short of 2^32: the
+// sequence number would come back, and ChaCha20-Poly1305's nonce is the
+// sequence number.
+let REKEY_PACKETS: i64 = 2147483648;
+let MAX_PACKETS: i64 = 4294967294;
+
 fn send_packet(c: Conn&, payload: const u8[:], out: u8[>..]&) {
+    if c.tx_packets >= MAX_PACKETS {
+        if c.state != ST_FAILED && c.state != ST_CLOSED {
+            c.reason = DISCONNECT_PROTOCOL_ERROR;
+            c.message.clear();
+            c.message.append("too many packets under one key");
+            c.state = ST_FAILED;
+        }
+        return;
+    }
+    let before = out.len;
     out.append(seal_packet(c.tx, payload));
-    c.bytes_since_kex += payload.len;
+    c.tx_bytes += out.len - before;
+    c.tx_packets++;
 }
 
 // Fails the connection: a DISCONNECT, if the version lines are done, and
@@ -533,6 +558,8 @@ fn send_newkeys(c: Conn&, out: u8[>..]&) {
     let seq = c.tx.seq;
     c.tx = c.tx_next;
     c.tx.seq = if c.strict { 0 } else { seq };
+    c.tx_bytes = 0;
+    c.tx_packets = 0;
     c.sent_newkeys = true;
 }
 
@@ -653,7 +680,8 @@ fn on_newkeys(c: Conn&, scfg: const ServerConfig&, m: const u8[:], out: u8[>..]&
     c.sent_kexinit = false;
     c.sent_newkeys = false;
     c.peer_kexinit.clear();
-    c.bytes_since_kex = 0;
+    c.rx_bytes = 0;
+    c.rx_packets = 0;
     c.kex_count++;
     if c.kex_count == 1 {
         c.state = ST_SERVICE;
@@ -1325,6 +1353,38 @@ fn channel_reply(c: Conn&, ch: i64, ok: bool, out: u8[>..]&) -> bool {
     return true;
 }
 
+// Holds a channel's window: the peer may send only as much as the
+// application has used (channel_consumed) plus one window, as Go's
+// channels open the window as they are read. For an application that
+// cannot always take the data at once (a child's stdin), which must still
+// read the connection, for the peer's own window adjustments.
+fn channel_hold_window(c: Conn&, ch: i64) -> bool {
+    if !channel_ok(c, ch) { return false; }
+    c.channels[ch].held = true;
+    return true;
+}
+
+// The application has used n more bytes of a held channel's data.
+fn channel_consumed(c: Conn&, ch: i64, n: i64, out: u8[>..]&) {
+    if !channel_ok(c, ch) || !c.channels[ch].held || n <= 0 { return; }
+    c.channels[ch].consumed += n as! u32;
+    open_window(c, ch, out);
+}
+
+// A held channel's WINDOW_ADJUST, once half the window is spent and what
+// has been used is given back.
+fn open_window(c: Conn&, ch: i64, out: u8[>..]&) {
+    let k = c.channels[ch];
+    if k.in_window >= CHANNEL_WINDOW / 2 || k.consumed == 0 || k.sent_close || c.state != ST_CONNECTED { return; }
+    var b: u8[>..] = [];
+    b.push(MSG_CHANNEL_WINDOW_ADJUST);
+    put_u32(b, k.remote);
+    put_u32(b, k.consumed);
+    send_packet(c, b, out);
+    c.channels[ch].in_window += k.consumed;
+    c.channels[ch].consumed = 0;
+}
+
 // How many bytes channel_send would take now: the peer's window, at most
 // one packet; 0 for a channel that takes none.
 fn channel_window(c: const Conn&, ch: i64) -> i64 {
@@ -1505,9 +1565,11 @@ fn connection_message(c: Conn&, m: const u8[:], out: u8[>..]&, events: u8[>..]&)
         }
         event(events, if t == MSG_CHANNEL_DATA { EV_DATA } else { EV_EXTENDED_DATA }, ch, code, bytes(m, d));
         // The data is the caller's now: the window opens again once half is
-        // used.
+        // used (for a held channel, once the caller has used it).
         c.channels[ch].in_window -= n as! u32;
-        if c.channels[ch].in_window < CHANNEL_WINDOW / 2 && !c.channels[ch].sent_close {
+        if c.channels[ch].held {
+            open_window(c, ch, out);
+        } else if c.channels[ch].in_window < CHANNEL_WINDOW / 2 && !c.channels[ch].sent_close {
             var b: u8[>..] = [];
             b.push(MSG_CHANNEL_WINDOW_ADJUST);
             put_u32(b, c.channels[ch].remote);
@@ -1718,8 +1780,11 @@ fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: c
             let n = packet_length(c.rx, c.inbuf);
             if n < 0 { return fail(c, DISCONNECT_PROTOCOL_ERROR, "bad packet length", out); }
             if n == 0 || c.inbuf.len < n { break; }
+            if c.rx_packets >= MAX_PACKETS { return fail(c, DISCONNECT_PROTOCOL_ERROR, "too many packets under one key", out); }
             let payload, ok = open_packet(c.rx, c.inbuf[..n]);
             if !ok { return fail(c, DISCONNECT_MAC_ERROR, "packet does not authenticate", out); }
+            c.rx_bytes += n;
+            c.rx_packets++;
             var rest: u8[>..] = [];
             rest.append(c.inbuf[n..]);
             c.inbuf.clear();
@@ -1728,9 +1793,15 @@ fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: c
             if handle_message(c, ccfg, scfg, payload, out, events) != 0 { return -1; }
             if c.state == ST_CLOSED { return 0; }
         }
-        // Rekey once enough has gone either way.
+        // Rekey once enough has gone either way, in bytes (rekey_bytes, 0
+        // for never) or packets (as Go: counted both ways, sent and
+        // received, as RFC 4253 §9 asks). Checked here, as input comes: an
+        // application that only sends still gets the peer's window
+        // adjustments, so it overshoots by a window at most.
         let limit = if c.is_server { scfg.rekey_bytes } else { ccfg.rekey_bytes };
-        if c.state == ST_CONNECTED && !c.in_kex && limit > 0 && c.bytes_since_kex >= limit {
+        let by_bytes = limit > 0 && (c.tx_bytes >= limit || c.rx_bytes >= limit);
+        let by_packets = c.tx_packets >= REKEY_PACKETS || c.rx_packets >= REKEY_PACKETS;
+        if c.state == ST_CONNECTED && !c.in_kex && (by_bytes || by_packets) {
             let ok = rekey(c, ccfg, scfg, out);
         }
         // Held for the application, or nothing more to do with what came.

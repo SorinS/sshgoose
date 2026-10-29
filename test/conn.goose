@@ -561,11 +561,128 @@ fn sessions() {
     check("disconnect", ssh::closed(c) && ssh::closed(s) && s.reason == ssh::DISCONNECT_BY_APPLICATION);
 }
 
+// A connected client and server with a session open, the server
+// rekeying after rekey_bytes.
+struct Pair { c: ssh::Conn, s: ssh::Conn, ch: i64 }
+
+fn connected(cc: const ssh::ClientConfig&, sc: const ssh::ServerConfig&, w: Seen&) -> Pair {
+    var c = ssh::client(cc);
+    var s = ssh::server(sc);
+    var to_server: u8[>..] = [];
+    var to_client: u8[>..] = [];
+    ssh::client_start(c, cc, to_server);
+    ssh::server_start(s, sc, to_client);
+    pump(c, cc, s, sc, to_server, to_client, w);
+    let ch = ssh::open_session(c, to_server);
+    pump(c, cc, s, sc, to_server, to_client, w);
+    return Pair { c: c, s: s, ch: ch };
+}
+
+// Rekeying counts both directions, bytes and packets, and no key carries
+// 2^32 packets.
+fn rekey_accounting() {
+    var cc = client_cfg();
+    let ed = ed25519_key();
+    let a = ssh::add_key(cc, ed);
+    var sc = server_cfg();
+    sc.authorized_keys.append(ssh::marshal_authorized_key(ed.public));
+    // The server only receives (its window adjustments are small): its
+    // rekey_bytes is reached by what comes in, and it rekeys (once per
+    // feed, here one).
+    {
+        sc.rekey_bytes = 200000;
+        var w = seen();
+        var p = connected(cc, sc, w);
+        var to_server: u8[>..] = [];
+        var to_client: u8[>..] = [];
+        var big: u8[>..] = [];
+        big.resize(600000, 0x5a);
+        var sent = 0;
+        for round in 100 {
+            sent += ssh::channel_send(p.c, p.ch, big[sent..], to_server);
+            pump(p.c, cc, p.s, sc, to_server, to_client, w);
+            if sent == big.len { break; }
+        }
+        check("received bytes rekey", sent == big.len && w.got_by_server == big.len && p.s.kex_count >= 2 &&
+              p.c.kex_count == p.s.kex_count);
+        sc.rekey_bytes = 1073741824;
+    }
+    // Packets: past REKEY_PACKETS received, a rekey even with rekey_bytes 0.
+    {
+        sc.rekey_bytes = 0;
+        var w = seen();
+        var p = connected(cc, sc, w);
+        var to_server: u8[>..] = [];
+        var to_client: u8[>..] = [];
+        let n0 = p.s.kex_count;
+        p.s.rx_packets = ssh::REKEY_PACKETS - 1;
+        let n = ssh::channel_send(p.c, p.ch, "one more", to_server);
+        pump(p.c, cc, p.s, sc, to_server, to_client, w);
+        check("received packets rekey", n == 8 && p.s.kex_count == n0 + 1 && p.s.rx_packets < 100);
+        sc.rekey_bytes = 1073741824;
+    }
+    // At MAX_PACKETS under one key, sending stops and the connection
+    // fails; receiving one more fails it too.
+    {
+        var w = seen();
+        var p = connected(cc, sc, w);
+        var to_server: u8[>..] = [];
+        var to_client: u8[>..] = [];
+        p.c.tx_packets = ssh::MAX_PACKETS;
+        let n = ssh::channel_send(p.c, p.ch, "too many", to_server);
+        check("no packet past the limit", to_server.len == 0 && p.c.state == ssh::ST_FAILED &&
+              p.c.reason == ssh::DISCONNECT_PROTOCOL_ERROR);
+        var q = connected(cc, sc, w);
+        q.s.rx_packets = ssh::MAX_PACKETS;
+        let m = ssh::channel_send(q.c, q.ch, "too many", to_server);
+        pump(q.c, cc, q.s, sc, to_server, to_client, w);
+        check("none accepted past the limit", q.s.state == ssh::ST_FAILED && q.s.reason == ssh::DISCONNECT_PROTOCOL_ERROR);
+    }
+}
+
+// A held window opens only as the server says it has used the data.
+fn held_window() {
+    var cc = client_cfg();
+    let ed = ed25519_key();
+    let a = ssh::add_key(cc, ed);
+    var sc = server_cfg();
+    sc.authorized_keys.append(ssh::marshal_authorized_key(ed.public));
+    var w = seen();
+    var p = connected(cc, sc, w);
+    var to_server: u8[>..] = [];
+    var to_client: u8[>..] = [];
+    check("hold", ssh::channel_hold_window(p.s, 0));
+    var big: u8[>..] = [];
+    big.resize(4000000, 0x33);
+    var sent = 0;
+    for round in 20 {
+        sent += ssh::channel_send(p.c, p.ch, big[sent..], to_server);
+        pump(p.c, cc, p.s, sc, to_server, to_client, w);
+    }
+    check("held: one window and no more", sent == 2097152 && w.got_by_server == 2097152);
+    ssh::channel_consumed(p.s, 0, 1048576, to_client);
+    pump(p.c, cc, p.s, sc, to_server, to_client, w);
+    for round in 20 {
+        sent += ssh::channel_send(p.c, p.ch, big[sent..], to_server);
+        pump(p.c, cc, p.s, sc, to_server, to_client, w);
+    }
+    check("held: as much again as was used", sent == 2097152 + 1048576 && w.got_by_server == sent);
+    ssh::channel_consumed(p.s, 0, 2097152, to_client);
+    pump(p.c, cc, p.s, sc, to_server, to_client, w);
+    for round in 20 {
+        sent += ssh::channel_send(p.c, p.ch, big[sent..], to_server);
+        pump(p.c, cc, p.s, sc, to_server, to_client, w);
+    }
+    check("held: the rest", sent == big.len && w.got_by_server == big.len);
+}
+
 fn main() {
     algorithms();
     authentication();
     host_keys();
     sessions();
+    rekey_accounting();
+    held_window();
     print("conn: ", checks, " checks, ", failures, " failed");
     if failures > 0 { exit(1); }
 }

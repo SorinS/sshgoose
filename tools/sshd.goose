@@ -76,17 +76,14 @@ fn host_key(path: const u8[:]) -> ssh::PrivateKey {
 // The one session of a connection: its channel, the child running in it
 // (on pipes, or a pty's master), what the client asked for, output the
 // channel's window has not taken yet, and input the child's stdin has not
-// (with the client's EOF, to pass on once it has).
+// (with the client's EOF, to pass on once it has): at most a window, as
+// the channel's window is held (channel_hold_window).
 struct Session {
     ch: i64, pid: i32, in_fd: i32, out_fd: i32, err_fd: i32, master: i32,
     want_pty: bool, term: u8[..64], cols: i32, rows: i32, env: u8[..4096],
     out_eof: bool, err_eof: bool, exited: bool, status: i32, finished: bool, in_eof: bool, in_pos: i64,
     pending: u8[..65536], pending_err: u8[..65536], pending_in: u8[>..],
 }
-
-// While this much input waits for the child, the socket is not read: the
-// client is held back by TCP rather than by the buffer growing.
-let MAX_PENDING_IN: i64 = 1 << 20;
 
 fn no_session() -> Session {
     Session { ch: -1, pid: -1, in_fd: -1, out_fd: -1, err_fd: -1, master: -1, want_pty: false, term: [], cols: 80, rows: 24,
@@ -139,7 +136,7 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
         let waiting_in = s.pending_in.len - s.in_pos;
         let watch_in = waiting_in > 0 && s.in_fd >= 0;
         var fds: i32[>..] = [];
-        fds.push(if waiting_in < MAX_PENDING_IN { sock } else { -1 });
+        fds.push(sock);
         fds.push(if watch_out { s.out_fd } else { -1 });
         fds.push(if watch_err { s.err_fd } else { -1 });
         fds.push(if watch_in { s.in_fd } else { -1 });
@@ -154,8 +151,9 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
         // in_pos on); the buffer empties once all is taken.
         if (ready & 8) != 0 {
             let n = sysnet::net_write_some(s.in_fd, s.pending_in[s.in_pos..]);
-            if n < 0 { s.in_pos = s.pending_in.len; }         // the child closed its stdin
-            else { s.in_pos += n; }
+            let took = if n < 0 { s.pending_in.len - s.in_pos } else { n };   // n < 0: the child closed its stdin
+            s.in_pos += took;
+            ssh::channel_consumed(c, s.ch, took, out);
             if s.in_pos == s.pending_in.len {
                 s.pending_in.clear();
                 s.in_pos = 0;
@@ -221,6 +219,12 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
                 if ssh::bytes(events, kind) == "session" && s.ch < 0 {
                     let a = ssh::channel_accept(c, e.channel, out);
                     s.ch = e.channel;
+                    // The client may send only as much as the child has
+                    // taken, plus a window: pending_in stays within one,
+                    // and the connection is always read (for the client's
+                    // own window adjustments, which the child's output
+                    // waits on).
+                    let h = ssh::channel_hold_window(c, s.ch);
                 } else if ssh::bytes(events, kind) == "direct-tcpip" {
                     let host = ssh::get_string(r, events);
                     let port: i64 = ssh::get_u32(r, events);
@@ -286,7 +290,10 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
             } else if e.kind == ssh::EV_DATA && e.channel == s.ch && s.in_fd >= 0 {
                 // A pipe's input waits its turn (above); a pty's is typed.
                 if s.master < 0 { s.pending_in.append(ssh::bytes(events, e.data)); }
-                else { let w = sysnet::net_write(s.in_fd, ssh::bytes(events, e.data)); }
+                else {
+                    let w = sysnet::net_write(s.in_fd, ssh::bytes(events, e.data));
+                    ssh::channel_consumed(c, s.ch, e.data.end - e.data.pos, out);
+                }
             } else if e.kind == ssh::EV_EOF && e.channel == s.ch {
                 // A pipe's stdin closes, once what came before is in; a
                 // pty's stays (the shell reads ^D).
