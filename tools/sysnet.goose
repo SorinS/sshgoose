@@ -14,8 +14,12 @@ extern fn net_accept(fd: i32, peer: u8[:], peer_len: i64&, peer_port: i32&) -> i
 extern fn net_local_port(fd: i32) -> i32;
 // ready[i] = 1 for each fds[i] (-1: none) readable or closed; how many, 0 on timeout.
 extern fn net_poll_set(fds: const i32[:], ready: u8[:], timeout_ms: i32) -> i32;
+// The same, waiting instead for fds[i] to take a write where write[i] != 0.
+extern fn net_poll_rw(fds: const i32[:], write: const u8[:], ready: u8[:], timeout_ms: i32) -> i32;
 extern fn net_read(fd: i32, buf: u8[:]) -> i64;
 extern fn net_write(fd: i32, data: const u8[:]) -> i64;
+// One write of what fits: bytes written, 0 when a non-blocking fd is full, -1 on error.
+extern fn net_write_some(fd: i32, data: const u8[:]) -> i64;
 extern fn net_close(fd: i32);
 extern fn net_shutdown_write(fd: i32);
 // Bit i set when the i-th descriptor (-1: none) is readable or closed; 0 on timeout.
@@ -30,6 +34,7 @@ extern fn tty_secret(prompt: const u8[:], out: u8[:]) -> i64;
 extern fn tty_line(prompt: const u8[:], out: u8[:]) -> i64;
 
 // env: NAME=VALUE lines for the child. cmd "" runs the user's login shell.
+// in_fd is non-blocking: write to it with net_write_some.
 extern fn proc_spawn(cmd: const u8[:], env: const u8[:], in_fd: i32&, out_fd: i32&, err_fd: i32&) -> i32;
 extern fn proc_spawn_pty(cmd: const u8[:], env: const u8[:], term: const u8[:], cols: i32, rows: i32, master: i32&) -> i32;
 extern fn proc_resize(master: i32, cols: i32, rows: i32);

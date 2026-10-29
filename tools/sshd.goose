@@ -63,18 +63,24 @@ fn host_key(path: const u8[:]) -> ssh::PrivateKey {
 }
 
 // The one session of a connection: its channel, the child running in it
-// (on pipes, or a pty's master), what the client asked for, and output the
-// channel's window has not taken yet.
+// (on pipes, or a pty's master), what the client asked for, output the
+// channel's window has not taken yet, and input the child's stdin has not
+// (with the client's EOF, to pass on once it has).
 struct Session {
     ch: i64, pid: i32, in_fd: i32, out_fd: i32, err_fd: i32, master: i32,
     want_pty: bool, term: u8[..64], cols: i32, rows: i32, env: u8[..4096],
-    out_eof: bool, err_eof: bool, exited: bool, status: i32, finished: bool,
-    pending: u8[..65536], pending_err: u8[..65536],
+    out_eof: bool, err_eof: bool, exited: bool, status: i32, finished: bool, in_eof: bool, in_pos: i64,
+    pending: u8[..65536], pending_err: u8[..65536], pending_in: u8[>..],
 }
+
+// While this much input waits for the child, the socket is not read: the
+// client is held back by TCP rather than by the buffer growing.
+let MAX_PENDING_IN: i64 = 1 << 20;
 
 fn no_session() -> Session {
     Session { ch: -1, pid: -1, in_fd: -1, out_fd: -1, err_fd: -1, master: -1, want_pty: false, term: [], cols: 80, rows: 24,
-              env: [], out_eof: true, err_eof: true, exited: false, status: 0, finished: false, pending: [], pending_err: [] }
+              env: [], out_eof: true, err_eof: true, exited: false, status: 0, finished: false, in_eof: false, in_pos: 0, pending: [],
+              pending_err: [], pending_in: [] }
 }
 
 fn send_all(sock: i32, out: u8[>..]&) -> bool {
@@ -119,15 +125,31 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
     loop {
         let watch_out = s.pid > 0 && !s.out_eof && s.pending.len == 0;
         let watch_err = s.pid > 0 && !s.err_eof && s.pending_err.len == 0;
+        let waiting_in = s.pending_in.len - s.in_pos;
+        let watch_in = waiting_in > 0 && s.in_fd >= 0;
         var fds: i32[>..] = [];
-        fds.push(sock);
+        fds.push(if waiting_in < MAX_PENDING_IN { sock } else { -1 });
         fds.push(if watch_out { s.out_fd } else { -1 });
         fds.push(if watch_err { s.err_fd } else { -1 });
+        fds.push(if watch_in { s.in_fd } else { -1 });
         relay::poll_fds(rl, c, fds);
         var flags: u8[>..] = [];
         flags.resize(fds.len, 0);
-        let nready = sysnet::net_poll_set(fds, flags, 200);
-        let ready = (if flags[0] != 0 { 1 } else { 0 }) | (if flags[1] != 0 { 2 } else { 0 }) | (if flags[2] != 0 { 4 } else { 0 });
+        var write: u8[4] = [0, 0, 0, 1];
+        let nready = sysnet::net_poll_rw(fds, write, flags, 200);
+        let ready = (if flags[0] != 0 { 1 } else { 0 }) | (if flags[1] != 0 { 2 } else { 0 }) | (if flags[2] != 0 { 4 } else { 0 })
+                    | (if flags[3] != 0 { 8 } else { 0 });
+        // The child's stdin takes what it can of the input waiting (from
+        // in_pos on); the buffer empties once all is taken.
+        if (ready & 8) != 0 {
+            let n = sysnet::net_write_some(s.in_fd, s.pending_in[s.in_pos..]);
+            if n < 0 { s.in_pos = s.pending_in.len; }         // the child closed its stdin
+            else { s.in_pos += n; }
+            if s.in_pos == s.pending_in.len {
+                s.pending_in.clear();
+                s.in_pos = 0;
+            }
+        }
         var events: u8[>..] = [];
         if (ready & 1) != 0 {
             input.clear();
@@ -251,19 +273,23 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
                 }
                 if e.value == 1 { let rr = ssh::channel_reply(c, e.channel, ok2, out); }
             } else if e.kind == ssh::EV_DATA && e.channel == s.ch && s.in_fd >= 0 {
-                let w = sysnet::net_write(s.in_fd, ssh::bytes(events, e.data));
+                // A pipe's input waits its turn (above); a pty's is typed.
+                if s.master < 0 { s.pending_in.append(ssh::bytes(events, e.data)); }
+                else { let w = sysnet::net_write(s.in_fd, ssh::bytes(events, e.data)); }
             } else if e.kind == ssh::EV_EOF && e.channel == s.ch {
-                // A pipe's stdin closes; a pty's stays (the shell reads ^D).
-                if s.master < 0 && s.in_fd >= 0 {
-                    sysnet::net_close(s.in_fd);
-                    s.in_fd = -1;
-                }
+                // A pipe's stdin closes, once what came before is in; a
+                // pty's stays (the shell reads ^D).
+                if s.master < 0 { s.in_eof = true; }
             } else if e.kind == ssh::EV_CLOSE && e.channel == s.ch {
                 if s.pid > 0 && !s.exited { sysnet::proc_kill(s.pid, 1); }
                 s.finished = true;
             }
         }
-        relay::service(rl, c, fds, flags, 3, out);
+        if s.in_eof && s.pending_in.len == s.in_pos && s.in_fd >= 0 && s.master < 0 {
+            sysnet::net_close(s.in_fd);
+            s.in_fd = -1;
+        }
+        relay::service(rl, c, fds, flags, 4, out);
         // The child's output into the channel, as its window allows.
         if s.ch >= 0 && ssh::connected(c) {
             if s.pending.len > 0 {

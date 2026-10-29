@@ -146,9 +146,10 @@ int32_t net_local_port(int32_t fd) {
 typedef struct { const int32_t *data; int64_t len; } net_fds;
 
 /* Waits up to timeout_ms for any descriptor of fds (-1 entries ignored, at
-   most 256) to be readable or closed: ready[i] is 1 for those that are.
-   How many are, 0 on timeout. */
-int32_t net_poll_set(net_fds fds, net_buf ready, int32_t timeout_ms) {
+   most 256) to be readable or closed, or, where write[i] is nonzero (write
+   may be shorter than fds), to take a write: ready[i] is 1 for those that
+   are. How many are, 0 on timeout. */
+int32_t net_poll_rw(net_fds fds, net_buf write, net_buf ready, int32_t timeout_ms) {
     struct pollfd p[256];
     int map[256];
     int n = 0;
@@ -156,7 +157,7 @@ int32_t net_poll_set(net_fds fds, net_buf ready, int32_t timeout_ms) {
         ready.data[i] = 0;
         if (fds.data[i] < 0) continue;
         p[n].fd = fds.data[i];
-        p[n].events = POLLIN;
+        p[n].events = i < write.len && write.data[i] ? POLLOUT : POLLIN;
         p[n].revents = 0;
         map[n++] = (int)i;
     }
@@ -164,8 +165,23 @@ int32_t net_poll_set(net_fds fds, net_buf ready, int32_t timeout_ms) {
     do { r = poll(p, (nfds_t)n, timeout_ms); } while (r < 0 && errno == EINTR);
     if (r <= 0) return r;
     for (int i = 0; i < n; i++)
-        if (p[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) ready.data[map[i]] = 1;
+        if (p[i].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR | POLLNVAL)) ready.data[map[i]] = 1;
     return r;
+}
+
+/* The same, for reading only. */
+int32_t net_poll_set(net_fds fds, net_buf ready, int32_t timeout_ms) {
+    net_buf none = { NULL, 0 };
+    return net_poll_rw(fds, none, ready, timeout_ms);
+}
+
+/* One write of what fits: how many bytes went, 0 when a non-blocking fd
+   is full, -1 on error (a closed reader among them). */
+int64_t net_write_some(int32_t fd, net_slice data) {
+    ssize_t n;
+    do { n = write(fd, data.data, (size_t)data.len); } while (n < 0 && errno == EINTR);
+    if (n < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
+    return (int64_t)n;
 }
 
 void net_shutdown_write(int32_t fd) { if (fd >= 0) shutdown(fd, SHUT_WR); }
@@ -334,6 +350,9 @@ int32_t proc_spawn(net_slice cmd, net_slice env, int32_t *in_fd, int32_t *out_fd
         _exit(127);
     }
     close(pin[0]); close(pout[1]); close(perr[1]);
+    /* The child's stdin takes what fits (net_write_some): a blocking write
+       there, with the child blocked writing a full stdout, would hang both. */
+    fcntl(pin[1], F_SETFL, fcntl(pin[1], F_GETFL) | O_NONBLOCK);
     *in_fd = pin[1];
     *out_fd = pout[0];
     *err_fd = perr[0];

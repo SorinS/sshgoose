@@ -103,7 +103,8 @@ tools/gossh.sh <mode> ...               # Go's side by hand (modes in tools/goss
 They take the compiler from `$GOOSE`, else `goose` on PATH, else
 `../goose.git/build/goose` (run_tests.py also takes `--goose`), and bigmongoose.git, asn1goose.git and
 x509goose.git beside this repository. interop.py also needs OpenSSH
-(`ssh`, `sshd`, `ssh-keygen`), Go with golang.org/x/crypto v0.55.0 in the
+(`ssh` and `ssh-keygen` from PATH; `sshd` from `$SSHD`, else the
+`sbin/sshd` beside that `ssh`, else `/usr/sbin/sshd`), Go with golang.org/x/crypto v0.55.0 in the
 module cache, `curl` and Python's http.server; it runs everything as you,
 on free ports of 127.0.0.1, and leaves nothing running.
 

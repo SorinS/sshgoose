@@ -62,6 +62,19 @@ def check(name, ok, detail=""):
     print(("ok    " if ok else "FAIL  ") + name + ("" if ok else f"\n      {detail}"))
 
 
+def find_sshd():
+    # $SSHD, else the sshd of the ssh on PATH (sbin beside its bin), else
+    # the system's.
+    if os.environ.get("SSHD"):
+        return os.environ["SSHD"]
+    ssh = shutil.which("ssh")
+    if ssh:
+        cand = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(ssh))), "sbin", "sshd")
+        if os.path.isfile(cand):
+            return cand
+    return "/usr/sbin/sshd"
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -125,7 +138,7 @@ def main():
                 "UsePAM no\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
                 "KexAlgorithms +diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group14-sha1\n"
                 "MACs +hmac-sha1\nHostKeyAlgorithms +ssh-rsa\n")
-    servers = [subprocess.Popen(["/usr/sbin/sshd", "-D", "-f", k("sshd_config"), "-E", k("sshd.log")]),
+    servers = [subprocess.Popen([find_sshd(), "-D", "-f", k("sshd_config"), "-E", k("sshd.log")]),
                subprocess.Popen([k("goose-sshd"), "-p", str(p_goose), "-h", k("host_ed25519"), "-k", k("authorized_keys"),
                                  "-P", k("passwords")], stderr=subprocess.DEVNULL),
                subprocess.Popen([k("gossh"), "server", str(p_go), k("host_ecdsa"), k("authorized_keys"), "gopw"],
