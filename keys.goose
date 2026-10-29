@@ -177,7 +177,7 @@ fn parse_public_key(blob: const u8[:]) -> PublicKey, bool {
         k.e.append(bytes(blob, e));
         k.n.append(nb);
         let pub, okp = bignum::rsa_public_from(bignum::from_bytes_be(k.n), bignum::from_bytes_be(k.e));
-        if !okp && bits <= 4096 { return k, false; }
+        if !okp { return k, false; }
     }
     k.blob.append(blob);
     return k, true;
