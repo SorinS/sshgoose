@@ -35,6 +35,7 @@ import hashlib
 import os
 import select
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -185,6 +186,46 @@ def main():
             cmd = [k("goose-ssh"), "-p", str(port), "-i", k(key), "-o", f"UserKnownHostsFile={kh or k('known_hosts')}",
                    "-o", "StrictHostKeyChecking=yes", *args]
             return run(cmd, stdin, env)
+
+        # A goose-sshd started with SIGHUP and SIGPIPE ignored (as under
+        # nohup): its sessions' children still get the default signals,
+        # and a session whose client is gone leaves no child behind.
+        p_nohup = free_port()
+        nohup = subprocess.Popen([k("goose-sshd"), "-p", str(p_nohup), "-h", k("host_ed25519"), "-k", k("authorized_keys")],
+                                 stderr=subprocess.DEVNULL,
+                                 preexec_fn=lambda: (signal.signal(signal.SIGHUP, signal.SIG_IGN),
+                                                     signal.signal(signal.SIGPIPE, signal.SIG_IGN)))
+        try:
+            check("nohup'd goose-sshd up", wait_port(p_nohup))
+            kh_nohup = k("known_hosts_nohup")
+            with open(kh_nohup, "w") as f:
+                f.write(f"[127.0.0.1]:{p_nohup} {pub('host_ed25519')}\n")
+            rc, out, err = gssh(p_nohup, "127.0.0.1", "kill -PIPE $$; echo still here", kh=kh_nohup)
+            check("child: SIGPIPE back to its default", rc == 128 + 13 and b"still here" not in out, f"rc {rc} {out!r}")
+            marker = "sleep 3017"
+            client = subprocess.Popen([k("goose-ssh"), "-p", str(p_nohup), "-i", k("user_ed25519"), "-o",
+                                       f"UserKnownHostsFile={kh_nohup}", "127.0.0.1", marker],
+                                      stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(50):
+                if subprocess.run(["pgrep", "-f", marker], capture_output=True).returncode == 0:
+                    break
+                time.sleep(0.1)
+            started = subprocess.run(["pgrep", "-f", marker], capture_output=True).returncode == 0
+            client.kill()
+            client.wait()
+            gone = False
+            for _ in range(150):
+                if subprocess.run(["pgrep", "-f", marker], capture_output=True).returncode != 0:
+                    gone = True
+                    break
+                time.sleep(0.1)
+            left = subprocess.run(["ps", "-axo", "pid,ppid,stat,command"], capture_output=True, text=True).stdout
+            left = "\n".join(l for l in left.splitlines() if marker in l or "goose-sshd" in l)
+            check("client killed: the session's child gone", started and gone, f"started {started}; left:\n{left}")
+            subprocess.run(["pkill", "-f", marker], capture_output=True)
+        finally:
+            nohup.terminate()
+            nohup.wait()
 
         big = os.urandom(5_000_000)
         digest = hashlib.sha256(big).hexdigest()

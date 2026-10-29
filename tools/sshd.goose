@@ -348,9 +348,17 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
             break;
         }
     }
+    // The connection is over: the child's pipes closed (EOF on its stdin,
+    // EPIPE on its output), then SIGHUP, then SIGKILL (proc_end).
     if s.pid > 0 && !s.exited {
-        sysnet::proc_kill(s.pid, 1);
-        let st = sysnet::proc_wait(s.pid, 1);
+        if s.master >= 0 {
+            sysnet::net_close(s.master);                    // a pty's one descriptor
+        } else {
+            if s.in_fd >= 0 { sysnet::net_close(s.in_fd); }
+            if s.out_fd >= 0 { sysnet::net_close(s.out_fd); }
+            if s.err_fd >= 0 { sysnet::net_close(s.err_fd); }
+        }
+        let st = sysnet::proc_end(s.pid);
     }
     sysnet::net_close(sock);
 }

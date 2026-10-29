@@ -40,6 +40,7 @@ extern fn proc_spawn_pty(cmd: const u8[:], env: const u8[:], term: const u8[:], 
 extern fn proc_resize(master: i32, cols: i32, rows: i32);
 extern fn proc_wait(pid: i32, wait: i32) -> i32;
 extern fn proc_kill(pid: i32, sig: i32);
+extern fn proc_end(pid: i32) -> i32;
 extern fn proc_fork() -> i32;
 extern fn proc_reap();
 extern fn proc_exit(code: i32);

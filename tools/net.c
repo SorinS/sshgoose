@@ -325,6 +325,19 @@ static void put_env(net_slice env) {
     }
 }
 
+/* A child's signals as a login's should be, whatever the server was
+   started with (nohup ignores SIGHUP, and the server itself ignores
+   SIGPIPE): every disposition the default, nothing blocked. Ignored
+   dispositions survive exec, and a child that ignores SIGHUP outlives its
+   session. */
+static void child_signals(void) {
+    const int sigs[] = { SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGPIPE, SIGCHLD, SIGALRM, SIGTSTP, SIGTTIN, SIGTTOU, SIGUSR1, SIGUSR2 };
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) signal(sigs[i], SIG_DFL);
+    sigset_t none;
+    sigemptyset(&none);
+    sigprocmask(SIG_SETMASK, &none, NULL);
+}
+
 /* Runs `cmd` with the user's shell (-c), or the shell itself for "",
    on three pipes: its stdin, stdout and stderr ends through the pointers.
    The child's pid, or -1. */
@@ -339,6 +352,7 @@ int32_t proc_spawn(net_slice cmd, net_slice env, int32_t *in_fd, int32_t *out_fd
     if (pid < 0) return -1;
     if (pid == 0) {
         setsid();
+        child_signals();
         dup2(pin[0], 0);
         dup2(pout[1], 1);
         dup2(perr[1], 2);
@@ -378,6 +392,7 @@ int32_t proc_spawn_pty(net_slice cmd, net_slice env, net_slice term, int32_t col
     if (pid < 0) { close(m); return -1; }
     if (pid == 0) {
         setsid();
+        child_signals();
         int s = open(slave, O_RDWR);
         if (s < 0) _exit(127);
         ioctl(s, TIOCSCTTY, 0);
@@ -419,6 +434,20 @@ int32_t proc_wait(int32_t pid, int32_t block) {
 }
 
 void proc_kill(int32_t pid, int32_t sig) { if (pid > 0) kill(-pid, sig); }
+
+/* Ends a session's child: SIGHUP to its process group, up to two seconds
+   to go, then SIGKILL. Its exit status, as proc_wait's. */
+int32_t proc_end(int32_t pid) {
+    if (pid <= 0) return 255;
+    kill(-pid, SIGHUP);
+    for (int i = 0; i < 200; i++) {
+        int32_t st = proc_wait(pid, 0);
+        if (st >= 0) return st;
+        usleep(10000);
+    }
+    kill(-pid, SIGKILL);
+    return proc_wait(pid, 1);
+}
 
 /* fork(), for a server's connection: 0 in the child. Children of the
    server are reaped as they end. */
