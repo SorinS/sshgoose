@@ -142,9 +142,10 @@ fn encrypted(w: const u8[:][:]) {
     check(str("passphrase ", w[1]), e == ssh::KEY_OK && eb == ssh::KEY_OK && k.public.blob[..] == base.public.blob[..] &&
           k.comment == comment);
     if e != ssh::KEY_OK { return; }
-    let s = ssh::sign(k, if k.key.kind == x509::KEY_RSA { "rsa-sha2-256" } else { ssh::key_type(k.key.kind) }, "data");
-    check(str("signs ", w[1]), s == ssh::sign(base, if k.key.kind == x509::KEY_RSA { "rsa-sha2-256" } else { ssh::key_type(k.key.kind) }, "data") ||
-          ssh::is_ecdsa(k.key.kind));
+    let salg = if k.key.kind == x509::KEY_RSA { "rsa-sha2-256" } else { ssh::key_type(k.key.kind) };
+    let s, oks = ssh::sign(k, salg, "data");
+    let sb, oksb = ssh::sign(base, salg, "data");
+    check(str("signs ", w[1]), oks && oksb && (s == sb || ssh::is_ecdsa(k.key.kind)));
     // Written here under the same cipher, read back.
     let mine = ssh::marshal_private_key(k, "another one", w[3], 1);
     let k2, e2 = ssh::parse_private_key(mine, "another one");
@@ -202,8 +203,8 @@ fn keys() {
         let wrong: const u8[:] = if alg == "rsa-sha2-256" { "rsa-sha2-512" } else { "rsa-sha2-256" };
         check(str("named otherwise ", w[1], " ", alg), !ssh::verify(pub, wrong, data, sig));
         // One of this package's, checked here and by Go (scripts/go_interop.py).
-        let mine = ssh::sign(k, alg, data);
-        check(str("own sig ", w[1], " ", alg), ssh::verify(pub, alg, data, mine));
+        let mine, okm = ssh::sign(k, alg, data);
+        check(str("own sig ", w[1], " ", alg), okm && ssh::verify(pub, alg, data, mine));
         // Ed25519 and RSA PKCS #1 v1.5 are deterministic: the same signature
         // as Go's (whose ECDSA is randomized, unlike RFC 6979's here).
         if !alg.starts_with("ecdsa") { check(str("same as go ", w[1], " ", alg), mine == sig); }
@@ -231,9 +232,9 @@ fn lines() {
     for kind in kinds {
         let g = ssh::generate_key(kind, 2048);
         let alg: const u8[:] = if kind == x509::KEY_RSA { "rsa-sha2-256" } else { ssh::key_type(kind) };
-        let s = ssh::sign(g, alg, "hello");
+        let s, oks = ssh::sign(g, alg, "hello");
         let p, okp = ssh::parse_public_key(g.public.blob);
-        check(str("generated ", ssh::key_type(kind)), okp && ssh::verify(p, alg, "hello", s));
+        check(str("generated ", ssh::key_type(kind)), oks && okp && ssh::verify(p, alg, "hello", s));
     }
 }
 

@@ -209,8 +209,9 @@ fn rsa_hash(alg: const u8[:]) -> i64 {
 }
 
 // A signature blob over data: string algorithm, string signature, where
-// ECDSA's is mpint r, mpint s.
-fn sign(k: const PrivateKey&, alg: const u8[:], data: const u8[:]) -> u8[>..] {
+// ECDSA's is mpint r, mpint s. Empty and false when RSA's private
+// operation fails its check (a fault), as Go's Signer returns an error.
+fn sign(k: const PrivateKey&, alg: const u8[:], data: const u8[:]) -> u8[>..], bool {
     assert(sig_fits(k.key.kind, alg));
     var out: u8[>..] = [];
     put_string(out, alg);
@@ -224,9 +225,14 @@ fn sign(k: const PrivateKey&, alg: const u8[:], data: const u8[:]) -> u8[>..] {
         put_mpint(rs, raw[c.len..]);
         put_string(out, rs);
     } else {
-        put_string(out, bignum::rsa_sign_pkcs1(k.key.rsa, data, rsa_hash(alg)));
+        let s, ok = bignum::rsa_sign_pkcs1(k.key.rsa, data, rsa_hash(alg));
+        if !ok {
+            var none: u8[>..] = [];
+            return none, false;
+        }
+        put_string(out, s);
     }
-    return out;
+    return out, true;
 }
 
 // Whether sig is a signature blob by k over data with algorithm alg

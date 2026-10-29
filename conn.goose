@@ -564,7 +564,9 @@ fn server_kex_init(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>
     b.push(MSG_KEX_ECDH_REPLY);
     put_string(b, key.public.blob);
     put_kex_value(b, c.kx, c.kx.mine);
-    put_string(b, sign(key, c.host_key_alg, h));
+    let sig, oks = sign(key, c.host_key_alg, h);
+    if !oks { return fail(c, DISCONNECT_KEY_EXCHANGE_FAILED, "host key signing failed", out); }
+    put_string(b, sig);
     send_packet(c, b, out);
     derive_ciphers(c, k_enc, h);
     send_newkeys(c, out);
@@ -936,7 +938,9 @@ fn client_auth(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&
         put_bool(b, true);
         put_string(b, a);
         put_string(b, k.public.blob);
-        put_string(b, sign(k, a, pk_signed_data(c.session_id, c.user, a, k.public.blob)));
+        let sig, oks = sign(k, a, pk_signed_data(c.session_id, c.user, a, k.public.blob));
+        if !oks { return fail(c, DISCONNECT_PROTOCOL_ERROR, "signing failed", out); }
+        put_string(b, sig);
         send_packet(c, b, out);
         c.auth_step = AUTH_PK_SIGNED;
         return 0;
