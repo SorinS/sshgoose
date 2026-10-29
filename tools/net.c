@@ -447,11 +447,50 @@ int64_t os_user(net_buf out) {
     return (int64_t)l;
 }
 
-/* chmod(2); 0 or -1. */
-int32_t os_chmod(net_slice path, int32_t mode) {
+/* The permission bits of a file (stat(2)), or -1 when it is not there or
+   cannot be looked at. */
+int32_t os_file_mode(net_slice path) {
     char p[4096];
+    struct stat st;
+    if (cstring(path, p, sizeof p) < 0 || stat(p, &st) < 0) return -1;
+    return (int32_t)(st.st_mode & 07777);
+}
+
+static int write_all(int fd, net_slice data) {
+    int64_t off = 0;
+    while (off < data.len) {
+        ssize_t n = write(fd, data.data + off, (size_t)(data.len - off));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        off += n;
+    }
+    return fsync(fd);
+}
+
+/* Writes a secret file, mode 0600 from the moment it exists, whatever the
+   umask: never through a symlink, never readable by others before a
+   chmod. With replace 0 the file must not exist yet (O_EXCL); with
+   replace 1 the data goes to a new file beside it (mkstemp) that is then
+   renamed over it, so the old file stays whole if anything fails. 0 or
+   -1. */
+int32_t os_write_private(net_slice path, net_slice data, int32_t replace) {
+    char p[4096], tmp[4096 + 8];
     if (cstring(path, p, sizeof p) < 0) return -1;
-    return chmod(p, (mode_t)mode);
+    if (!replace) {
+        int fd = open(p, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd < 0) return -1;
+        int bad = write_all(fd, data) < 0;
+        if (close(fd) < 0) bad = 1;
+        if (bad) { unlink(p); return -1; }
+        return 0;
+    }
+    snprintf(tmp, sizeof tmp, "%s.XXXXXX", p);
+    int fd = mkstemp(tmp);
+    if (fd < 0) return -1;
+    int bad = fchmod(fd, 0600) < 0 || write_all(fd, data) < 0;
+    if (close(fd) < 0) bad = 1;
+    if (bad || rename(tmp, p) < 0) { unlink(tmp); return -1; }
+    return 0;
 }
 
 int64_t os_home(net_buf out) {

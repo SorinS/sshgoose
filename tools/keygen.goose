@@ -73,7 +73,7 @@ fn new_passphrase(given: bool, pass: const u8[:]) -> u8[>..], bool {
 }
 
 fn save(path: const u8[:], k: const ssh::PrivateKey&, pass: const u8[:], cipher: const u8[:], rounds: i64) -> bool {
-    if !write_file(path, ssh::marshal_private_key(k, pass, cipher, rounds)) || sysnet::os_chmod(path, 384) != 0 {  // 0600
+    if sysnet::os_write_private(path, ssh::marshal_private_key(k, pass, cipher, rounds), 1) != 0 {   // 0600 from the start
         let x = fail(str("cannot write ", path));
         return false;
     }

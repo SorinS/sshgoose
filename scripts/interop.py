@@ -36,6 +36,7 @@ import os
 import select
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -129,6 +130,32 @@ def main():
         f.write("#!/bin/sh\necho letmein\n")
     os.chmod(k("askpass"), 0o755)
     pub = lambda name: " ".join(open(k(name + ".pub")).read().split()[:2])
+
+    # Private key files are 0600 from the start whatever the umask, and a
+    # host key that others may read is refused, as OpenSSH does.
+    mode = lambda name: stat.S_IMODE(os.stat(k(name)).st_mode)
+    old_umask = os.umask(0)
+    try:
+        subprocess.run([k("goose-ssh-keygen"), "-t", "ed25519", "-N", "", "-f", k("umask_key")], check=True,
+                       capture_output=True)
+        check("keygen: a new key is 0600 under umask 000", mode("umask_key") == 0o600, oct(mode("umask_key")))
+        rc, _, err = run([k("goose-ssh-keygen"), "-p", "-P", "", "-N", "x", "-f", k("umask_key")])
+        check("keygen -p: the rewritten key is 0600", rc == 0 and mode("umask_key") == 0o600, err.decode())
+        p_new = free_port()
+        s = subprocess.Popen([k("goose-sshd"), "-p", str(p_new), "-h", k("new_host"), "-k", k("authorized_keys")],
+                             stderr=subprocess.DEVNULL)
+        up = wait_port(p_new)
+        s.terminate()
+        s.wait()
+        check("sshd: a new host key is 0600 under umask 000", up and mode("new_host") == 0o600,
+              oct(mode("new_host")) if os.path.exists(k("new_host")) else "no key")
+    finally:
+        os.umask(old_umask)
+    shutil.copy(k("host_ed25519"), k("open_host"))
+    os.chmod(k("open_host"), 0o644)
+    rc, _, err = run([k("goose-sshd"), "-p", str(free_port()), "-h", k("open_host"), "-k", k("authorized_keys")],
+                     timeout=30)
+    check("sshd: a host key others may read is refused", rc != 0 and b"too open" in err, err.decode())
 
     # The three servers.
     p_openssh, p_goose, p_go = free_port(), free_port(), free_port()

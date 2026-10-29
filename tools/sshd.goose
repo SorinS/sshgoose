@@ -40,10 +40,21 @@ fn usage() {
     exit(1);
 }
 
-// A host key from its file, or a new Ed25519 one written there.
+// A host key from its file, or a new Ed25519 one written there, mode
+// 0600. As in OpenSSH, a key file others may read is refused, and one
+// that is there but cannot be read is an error, not a reason for a new key.
 fn host_key(path: const u8[:]) -> ssh::PrivateKey {
-    var text: u8[>..] = [];
-    if read_file(path, text) {
+    let mode = sysnet::os_file_mode(path);
+    if mode >= 0 {
+        if mode & 63 != 0 {                                 // 077
+            sysnet::eprint(str("goose-sshd: ", path, ": permissions are too open (others may read it)\n"));
+            exit(1);
+        }
+        var text: u8[>..] = [];
+        if !read_file(path, text) {
+            sysnet::eprint(str("goose-sshd: cannot read ", path, "\n"));
+            exit(1);
+        }
         let k, e = ssh::parse_private_key(text);
         if e != ssh::KEY_OK {
             sysnet::eprint(str("goose-sshd: ", path, ": not a usable host key\n"));
@@ -53,7 +64,7 @@ fn host_key(path: const u8[:]) -> ssh::PrivateKey {
     }
     var k = ssh::generate_key(x509::KEY_ED25519);
     k.comment.append("goose-sshd host key");
-    if !write_file(path, ssh::marshal_private_key(k)) {
+    if sysnet::os_write_private(path, ssh::marshal_private_key(k), 0) != 0 {
         sysnet::eprint(str("goose-sshd: cannot write ", path, "\n"));
         exit(1);
     }

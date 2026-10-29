@@ -266,9 +266,22 @@ fn authentication() {
         var cc = client_cfg();
         let a = ssh::add_key(cc, k);
         var sc = server_cfg();
-        sc.authorized_keys.append(str("# a comment\n", "no-pty ", ssh::marshal_authorized_key(k.public, "alice's key")));
+        sc.authorized_keys.append(str("# a comment\n", ssh::marshal_authorized_key(k.public, "alice's key")));
         let r = connect(cc, sc, false);
         check(str("publickey ", n), r.ok);
+    }
+    // A line with options is not enforced, so it lets nobody in.
+    {
+        let k = ed25519_key();
+        let restrictions: const u8[:][3] = ["no-pty ", "restrict,command=\"false\",from=\"192.0.2.1\" ", "command=\"date\" "];
+        for o in restrictions {
+            var cc = client_cfg();
+            let a = ssh::add_key(cc, k);
+            var sc = server_cfg();
+            sc.authorized_keys.append(str(o, ssh::marshal_authorized_key(k.public)));
+            let r = connect(cc, sc, false);
+            check(str("options refused: ", o), !r.ok && r.client_reason == ssh::DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE);
+        }
     }
     // A key the server does not take, then one it does.
     {

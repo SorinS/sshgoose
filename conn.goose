@@ -989,11 +989,13 @@ fn client_password(c: Conn&, cfg: const ClientConfig&, pw: const u8[:], out: u8[
 
 // --- Authentication: the server -----------------------------------------------------------
 
-// Whether a key is one of authorized_keys'.
+// Whether a key is one of authorized_keys'. A line with options
+// (command=, from=, restrict, no-pty, ...) never authorizes: nothing here
+// enforces them, and a restriction ignored is a key let in unrestricted.
 fn key_authorized(cfg: const ServerConfig&, blob: const u8[:]) -> bool {
     for line in split(cfg.authorized_keys, '\n') {
         let k, opts, comment, ok = parse_authorized_key(line);
-        if ok && k.blob[..] == blob { return true; }
+        if ok && opts.len == 0 && k.blob[..] == blob { return true; }
     }
     return false;
 }

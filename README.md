@@ -32,7 +32,8 @@ server, and `goose-ssh-keygen` (see below).
   exchange, negotiation, strict key exchange (Terrapin), server-sig-algs
   (RFC 8308), rekeying; the host key against known_hosts lines (patterns,
   hashed entries, ports, @revoked), a fixed key, or put to the application;
-  publickey (query, then signature), password and keyboard-interactive
+  publickey (query, then signature; the server refuses authorized_keys
+  lines with options, which it does not enforce), password and keyboard-interactive
   authentication both ways, the client asking for a password only when it
   needs one; channels with flow control, data and stderr, exec, shell,
   pty-req, env, subsystem, window-change, exit-status and exit-signal;
@@ -72,7 +73,10 @@ no terminal); password prompts likewise.
 
 `goose-sshd` lets in the user running it: `-p port` (2222), `-a address`
 (127.0.0.1), `-h host_key_file` (`./goose_host_ed25519_key`, made on first
-start), `-k authorized_keys` (`~/.ssh/authorized_keys`), `-P
+start with mode 0600; as in OpenSSH, one that others may read is
+refused), `-k authorized_keys` (`~/.ssh/authorized_keys`; a line with
+options, `command=`, `from=`, `restrict` and the like, lets nobody in,
+since they are not enforced), `-P
 password_file` ("user:password" lines, plain or bcrypt), `-u user`,
 `-b banner`, `-g`, `-v`. Each connection is a process of its own; a session
 runs a command or the user's shell, on a pty when asked, and ends with its
@@ -134,7 +138,7 @@ on free ports of 127.0.0.1, and leaves nothing running.
   cancel-tcpip-forward; an unknown global request refused; replies in
   order; 40 channels at once.
 
-`scripts/interop.py` runs live connections on 127.0.0.1 (185 cases):
+`scripts/interop.py` runs live connections on 127.0.0.1 (189 cases):
 goose-ssh against an OpenSSH sshd (10.3, run as the user, with DH and
 ssh-rsa enabled again), Go's x/crypto/ssh server and goose-sshd, with
 every key exchange, cipher and MAC, every host key type, Ed25519 and RSA
