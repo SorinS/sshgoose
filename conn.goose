@@ -228,6 +228,7 @@ struct Conn {
     auth_methods: u8[..256],                   // what the server's last failure allowed
     global_replies: i64,                       // the peer's global requests awaiting the application's reply
     channels: Channel[..64],
+    deferred: u8[..65536],                     // messages held during our key exchange (send_packet)
     inbuf: u8[..270000],
 }
 
@@ -241,7 +242,7 @@ fn new_conn(is_server: bool) -> Conn {
         kex_count: 0, ignore_next: false, tx: no_cipher(), rx: no_cipher(), tx_next: no_cipher(), rx_next: no_cipher(),
         tx_bytes: 0, tx_packets: 0, rx_bytes: 0, rx_packets: 0, user: [], auth_step: AUTH_NONE, key_index: 0, password_tried: false, kbd_tried: false,
         auth_tries: 0, kbd_pending: false, banner_sent: false, password: [], has_password: false, host_key_wait: false, held_k: [], held_h: [],
-        auth_methods: [], global_replies: 0, channels: [], inbuf: [],
+        auth_methods: [], global_replies: 0, channels: [], deferred: [], inbuf: [],
     };
     for i in MAX_CHANNELS { c.channels.push(free_channel()); }
     return c;
@@ -301,7 +302,41 @@ fn next_event(events: const u8[:], pos: i64&) -> Event, bool {
 let REKEY_PACKETS: i64 = 2147483648;
 let MAX_PACKETS: i64 = 4294967294;
 
+// Whether a message may go while our KEXINIT waits for our NEWKEYS: the
+// transport's generic messages but SERVICE_REQUEST and SERVICE_ACCEPT, and
+// the key exchange's own (RFC 4253 §7.1).
+fn kex_may_send(t: u8) -> bool { (t >= 1 && t <= 19 && t != MSG_SERVICE_REQUEST && t != MSG_SERVICE_ACCEPT) || (t >= 20 && t <= 49) }
+
 fn send_packet(c: Conn&, payload: const u8[:], out: u8[>..]&) {
+    // Between our KEXINIT and our NEWKEYS anything else waits, in order, and
+    // goes once NEWKEYS has (flush_deferred); too much waiting fails the
+    // connection rather than lose a message.
+    if c.sent_kexinit && !c.sent_newkeys && payload.len > 0 && !kex_may_send(payload[0]) {
+        if c.deferred.len + 4 + payload.len > c.deferred.cap {
+            let msg = "too much to send during a key exchange";
+            var b: u8[>..] = [];
+            b.push(MSG_DISCONNECT);
+            put_u32(b, DISCONNECT_PROTOCOL_ERROR);
+            put_string(b, msg);
+            put_string(b, "");
+            seal_out(c, b, out);
+            c.reason = DISCONNECT_PROTOCOL_ERROR;
+            c.message.clear();
+            c.message.append(msg);
+            c.state = ST_FAILED;
+            return;
+        }
+        let n = payload.len;
+        let len: u8[4] = [(n >> 24) as! u8, (n >> 16) as! u8, (n >> 8) as! u8, n as! u8];
+        c.deferred.append(len);
+        c.deferred.append(payload);
+        return;
+    }
+    seal_out(c, payload, out);
+}
+
+// A packet under the current keys, counted; none past MAX_PACKETS.
+fn seal_out(c: Conn&, payload: const u8[:], out: u8[>..]&) {
     if c.tx_packets >= MAX_PACKETS {
         if c.state != ST_FAILED && c.state != ST_CLOSED {
             c.reason = DISCONNECT_PROTOCOL_ERROR;
@@ -315,6 +350,19 @@ fn send_packet(c: Conn&, payload: const u8[:], out: u8[>..]&) {
     out.append(seal_packet(c.tx, payload));
     c.tx_bytes += out.len - before;
     c.tx_packets++;
+}
+
+// The messages held during the key exchange, under the new keys.
+fn flush_deferred(c: Conn&, out: u8[>..]&) {
+    var held: u8[>..] = [];
+    held.append(c.deferred);
+    c.deferred.clear();
+    var pos = 0;
+    while pos + 4 <= held.len {
+        let n = ((held[pos] as i64) << 24) | ((held[pos + 1] as i64) << 16) | ((held[pos + 2] as i64) << 8) | held[pos + 3];
+        seal_out(c, held[pos + 4..pos + 4 + n], out);
+        pos += 4 + n;
+    }
 }
 
 // Fails the connection: a DISCONNECT, if the version lines are done, and
@@ -561,6 +609,7 @@ fn send_newkeys(c: Conn&, out: u8[>..]&) {
     c.tx_bytes = 0;
     c.tx_packets = 0;
     c.sent_newkeys = true;
+    flush_deferred(c, out);
 }
 
 // The server: the client's public value; it answers with its host key,

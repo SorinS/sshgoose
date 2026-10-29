@@ -676,6 +676,67 @@ fn held_window() {
     check("held: the rest", sent == big.len && w.got_by_server == big.len);
 }
 
+// Between a side's KEXINIT and its NEWKEYS nothing but the exchange's
+// messages may go (RFC 4253 §7.1); what the application or the window
+// wants to send meanwhile waits, and goes after.
+fn kex_holds_messages() {
+    var cc = client_cfg();
+    let ed = ed25519_key();
+    let a = ssh::add_key(cc, ed);
+    var sc = server_cfg();
+    sc.authorized_keys.append(ssh::marshal_authorized_key(ed.public));
+    var big: u8[>..] = [];
+    big.resize(1500000, 0x44);
+    // The server rekeys, then uses data that came before: its
+    // WINDOW_ADJUST waits for its NEWKEYS.
+    {
+        var w = seen();
+        var p = connected(cc, sc, w);
+        var to_server: u8[>..] = [];
+        var to_client: u8[>..] = [];
+        check("hold", ssh::channel_hold_window(p.s, 0));
+        let n0 = p.s.kex_count;
+        var sent = 0;
+        while sent < big.len {
+            let n = ssh::channel_send(p.c, p.ch, big[sent..], to_server);
+            if n == 0 { break; }
+            sent += n;
+        }
+        check("server rekey", ssh::server_rekey(p.s, sc, to_client));
+        var sev: u8[>..] = [];
+        let rs = ssh::server_feed(p.s, sc, to_server, to_client, sev);
+        to_server.clear();
+        ssh::channel_consumed(p.s, 0, sent, to_client);
+        check("server: the adjust waits", sent == big.len && p.s.deferred.len > 0);
+        pump(p.c, cc, p.s, sc, to_server, to_client, w);
+        check("server: rekeyed, then the adjust", !ssh::failed(p.c) && !ssh::failed(p.s) && p.s.kex_count == n0 + 1 &&
+              p.c.kex_count == n0 + 1 && p.s.deferred.len == 0 && p.c.channels[p.ch].out_window > 1048576);
+    }
+    // The client rekeys, then gets data the server sent before it saw the
+    // KEXINIT: the client's own WINDOW_ADJUST waits.
+    {
+        var w = seen();
+        var p = connected(cc, sc, w);
+        var to_server: u8[>..] = [];
+        var to_client: u8[>..] = [];
+        let n0 = p.c.kex_count;
+        check("client rekey", ssh::client_rekey(p.c, cc, to_server));
+        var sent = 0;
+        while sent < big.len {
+            let n = ssh::channel_send(p.s, 0, big[sent..], to_client);
+            if n == 0 { break; }
+            sent += n;
+        }
+        var cev: u8[>..] = [];
+        let rc = ssh::client_feed(p.c, cc, to_client, to_server, cev);
+        to_client.clear();
+        check("client: the adjust waits", sent == big.len && p.c.deferred.len > 0);
+        pump(p.c, cc, p.s, sc, to_server, to_client, w);
+        check("client: rekeyed, then the adjust", !ssh::failed(p.c) && !ssh::failed(p.s) && p.c.kex_count == n0 + 1 &&
+              p.s.kex_count == n0 + 1 && p.c.deferred.len == 0);
+    }
+}
+
 fn main() {
     algorithms();
     authentication();
@@ -683,6 +744,7 @@ fn main() {
     sessions();
     rekey_accounting();
     held_window();
+    kex_holds_messages();
     print("conn: ", checks, " checks, ", failures, " failed");
     if failures > 0 { exit(1); }
 }

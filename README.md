@@ -33,7 +33,9 @@ server, and `goose-ssh-keygen` (see below).
   (RFC 8308), rekeying (on request, after `rekey_bytes` sent or received,
   1 GB by default, or 2^31 packets either way, as Go; past 2^32 − 2 packets
   under one key, where ChaCha20-Poly1305's nonce would repeat, the
-  connection fails); the host key against known_hosts lines (patterns,
+  connection fails; between its KEXINIT and its NEWKEYS a side sends only
+  the exchange's messages, RFC 4253 §7.1, and what else it has waits and
+  goes after); the host key against known_hosts lines (patterns,
   hashed entries, ports, @revoked), a fixed key, or put to the application;
   publickey (query, then signature; the server refuses authorized_keys
   lines with options, which it does not enforce), password and keyboard-interactive
@@ -139,7 +141,8 @@ on free ports of 127.0.0.1, and leaves nothing running.
   each way through the windows, rekeys from both sides, disconnect;
   rekeying on bytes received alone and on the packet count, and the
   connection failed at the packet limit, sending and receiving; a held
-  window that lets in one window and then only what was used.
+  window that lets in one window and then only what was used; window
+  adjustments wanted during either side's rekey held until its NEWKEYS.
 - `forward`: port forwarding in memory: direct-tcpip with its target and
   originator, data, EOF and close, and a refused one; tcpip-forward on port
   0 and the port in the reply; forwarded-tcpip channels from the server;
