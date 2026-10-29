@@ -479,13 +479,15 @@ int64_t os_user(net_buf out) {
 /* Reads a private file in one open: not through a symlink (O_NOFOLLOW),
    and then checked on the descriptor itself (fstat), so nothing can be
    swapped in between: a regular file, owned by this user, that no one else
-   may read or write. Its length into out, or -1 when it is not there, -2
+   may read or write. O_NONBLOCK so that a FIFO there opens at once (and is
+   refused as not a regular file) instead of waiting for a writer; it does
+   nothing to a regular file's reads. Its length into out, or -1 when it is not there, -2
    when it cannot be opened, -3 not a regular file, -4 owned by another
    user, -5 group or others have access, -6 too long or unreadable. */
 int64_t os_read_private(net_slice path, net_buf out) {
     char p[4096];
     if (cstring(path, p, sizeof p) < 0) return -2;
-    int fd = open(p, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int fd = open(p, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) return errno == ENOENT ? -1 : -2;
     struct stat st;
     int64_t r = 0;

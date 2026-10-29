@@ -161,6 +161,26 @@ def main():
     rc, _, err = run([k("goose-sshd"), "-p", str(free_port()), "-h", k("linked_host"), "-k", k("authorized_keys")],
                      timeout=30)
     check("sshd: a host key through a symlink is refused", rc != 0 and b"symlink" in err, err.decode())
+    # A FIFO with no writer: refused at once as not a regular file, not
+    # waited on (open without O_NONBLOCK would block).
+    os.mkfifo(k("fifo_host"), 0o600)
+    try:
+        rc, _, err = run([k("goose-sshd"), "-p", str(free_port()), "-h", k("fifo_host"), "-k", k("authorized_keys")],
+                         timeout=10)
+        check("sshd: a FIFO host key is refused at once", rc != 0 and b"not a regular file" in err, err.decode())
+    except subprocess.TimeoutExpired:
+        check("sshd: a FIFO host key is refused at once", False, "blocked for 10 s")
+    # A directory, and a key file too long to be one.
+    os.mkdir(k("dir_host"), 0o700)
+    rc, _, err = run([k("goose-sshd"), "-p", str(free_port()), "-h", k("dir_host"), "-k", k("authorized_keys")],
+                     timeout=10)
+    check("sshd: a directory as host key is refused", rc != 0 and b"not a regular file" in err, err.decode())
+    with open(k("big_host"), "wb") as f:
+        f.write(b"x" * 70000)
+    os.chmod(k("big_host"), 0o600)
+    rc, _, err = run([k("goose-sshd"), "-p", str(free_port()), "-h", k("big_host"), "-k", k("authorized_keys")],
+                     timeout=10)
+    check("sshd: a host key file too long is refused", rc != 0 and b"too long" in err, err.decode())
 
     # The three servers.
     p_openssh, p_goose, p_go = free_port(), free_port(), free_port()
