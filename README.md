@@ -231,7 +231,7 @@ ssh-keygen (and by Go, for the AES-256 CTR and CBC ones it reads), and
 its fingerprints equal to ssh-keygen's.
 
 And SFTP: `scripts/sftp_raw.py` sends goose-sftp-server and OpenSSH's
-sftp-server the same 100 requests, byte by byte, and compares their replies
+sftp-server the same 91 requests, byte by byte, and compares their replies
 (stale and malformed handles, EXCL and APPEND, reads past the end and cut
 at the limit, links, RENAME onto a file and posix-rename, directories, NUL
 and over-long paths, every attribute, every extension); one `sftp -D` batch
