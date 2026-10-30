@@ -338,8 +338,18 @@ static void child_signals(void) {
     sigprocmask(SIG_SETMASK, &none, NULL);
 }
 
+/* A session's working directory, as OpenSSH's: the user's home ($HOME,
+   which the server shares with its user), else the root. */
+static void home_dir(void) {
+    const char *h = getenv("HOME");
+    if (!h || !*h || chdir(h) != 0) {
+        if (chdir("/") != 0) _exit(127);
+    }
+}
+
 /* Runs `cmd` with the user's shell (-c), or the shell itself for "",
-   on three pipes: its stdin, stdout and stderr ends through the pointers.
+   in the home directory, on three pipes: its stdin, stdout and stderr
+   ends through the pointers.
    The child's pid, or -1. */
 int32_t proc_spawn(net_slice cmd, net_slice env, int32_t *in_fd, int32_t *out_fd, int32_t *err_fd) {
     char c[65536];
@@ -358,6 +368,7 @@ int32_t proc_spawn(net_slice cmd, net_slice env, int32_t *in_fd, int32_t *out_fd
         dup2(perr[1], 2);
         close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]); close(perr[0]); close(perr[1]);
         put_env(env);
+        home_dir();
         const char *sh = user_shell();
         if (c[0]) execl(sh, sh, "-c", c, (char *)NULL);
         else execl(sh, sh, "-l", (char *)NULL);
@@ -402,6 +413,7 @@ int32_t proc_spawn_pty(net_slice cmd, net_slice env, net_slice term, int32_t col
         close(m);
         if (t[0]) setenv("TERM", t, 1);
         put_env(env);
+        home_dir();
         const char *sh = user_shell();
         if (c[0]) execl(sh, sh, "-c", c, (char *)NULL);
         else execl(sh, sh, "-l", (char *)NULL);
