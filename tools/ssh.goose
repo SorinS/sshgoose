@@ -35,15 +35,7 @@ import ssh.keys;
 import ssh.conn;
 import .sysnet;
 import .relay;
-
-var verbose = false;
-
-fn log(s: const u8[:]) { if verbose { sysnet::eprint(str("goose-ssh: ", s, "\n")); } }
-
-fn die(s: const u8[:]) -> i32 {
-    sysnet::eprint(str("goose-ssh: ", s, "\n"));
-    return 255;
-}
+import .login;
 
 fn usage() -> i32 {
     sysnet::eprint("usage: goose-ssh [-p port] [-l user] [-i keyfile]... [-o option=value]... [-t | -T] [-v]\n");
@@ -104,36 +96,6 @@ fn parse_forward(kind: u8, spec: const u8[:]) -> u8[>..] {
     return parts;
 }
 
-// Adds a key file; false if it is not there or not usable. For a
-// protected one the passphrase is asked for (on the terminal, or from
-// $SSH_ASKPASS) up to three times, as ssh does; an empty answer skips it.
-fn load_key(cfg: ssh::ClientConfig&, path: const u8[:], required: bool) -> bool {
-    var text: u8[>..] = [];
-    if !read_file(path, text) {
-        if required { sysnet::eprint(str("goose-ssh: cannot read ", path, "\n")); }
-        return false;
-    }
-    var k, e = ssh::parse_private_key(text);
-    var tries = 0;
-    while (e == ssh::KEY_ENCRYPTED || e == ssh::KEY_BAD_PASSPHRASE) && tries < 3 {
-        if e == ssh::KEY_BAD_PASSPHRASE { sysnet::eprint("Bad passphrase, try again.\n"); }
-        let pass = sysnet::secret(str("Enter passphrase for key '", path, "': "));
-        if pass.len == 0 { return false; }
-        let k2, e2 = ssh::parse_private_key(text, pass);
-        k = k2;
-        e = e2;
-        tries++;
-    }
-    if e != ssh::KEY_OK {
-        let why: const u8[:] = if e == ssh::KEY_BAD_PASSPHRASE { "bad passphrase" }
-                               else if e == ssh::KEY_ENCRYPTED { "no passphrase given" } else { "not a usable key" };
-        sysnet::eprint(str("goose-ssh: ", path, ": ", why, "\n"));
-        return false;
-    }
-    log(str("key ", path, " ", ssh::fingerprint_sha256(k.public)));
-    return ssh::add_key(cfg, k);
-}
-
 // The connection's state between the socket, the terminal and the Conn.
 struct Session {
     sock: i32, ch: i64, exit: i64, opened: bool, done: bool, stdin_eof: bool,
@@ -151,14 +113,8 @@ fn send_all(sock: i32, out: u8[>..]&) -> bool {
 fn run() -> i32 {
     sysnet::net_init();
     let a = args();
-    var port = 22;
-    var user: u8[>..] = [];
-    var keyfiles: u8[>..] = [];             // one path per line
-    var known_hosts_file: u8[>..] = [];
-    var strict: u8[>..] = [];
-    strict.append("ask");
+    var o = login::options("goose-ssh");
     var force_pty = 0;                      // 1: -t, -1: -T
-    var algs: u8[>..] = [];                 // "kind list" lines from -o
     var forwards: u8[>..] = [];             // "kind bind port host hostport" lines (bind "-" for none)
     var no_command = false;
     var target: u8[>..] = [];
@@ -167,9 +123,10 @@ fn run() -> i32 {
     while i < a.len {
         let w = a[i];
         if target.len == 0 && w.len > 1 && w[0] == '-' {
-            if (w == "-p" || w == "-l" || w == "-i" || w == "-o" || w == "-L" || w == "-R" || w == "-D") && i + 1 >= a.len {
-                return usage();
-            }
+            let t = login::take_option(o, a, i, "-p");
+            if t < 0 { return usage(); }
+            if t > 0 { continue; }
+            if (w == "-l" || w == "-L" || w == "-R" || w == "-D") && i + 1 >= a.len { return usage(); }
             if w == "-L" || w == "-R" || w == "-D" {
                 let f = parse_forward(w[1], a[i + 1]);
                 if f.len == 0 { sysnet::eprint(str("goose-ssh: bad forward ", w, " ", a[i + 1], "\n")); return 255; }
@@ -179,34 +136,13 @@ fn run() -> i32 {
                 continue;
             }
             if w == "-N" { no_command = true; i++; continue; }
-            if w == "-p" {
-                let v, ok = parse_int(a[i + 1], 10);
-                if !ok || v <= 0 || v > 65535 { return usage(); }
-                port = v;
-                i += 2;
-            } else if w == "-l" {
-                user.clear();
-                user.append(a[i + 1]);
-                i += 2;
-            } else if w == "-i" {
-                keyfiles.append(a[i + 1]);
-                keyfiles.push('\n');
-                i += 2;
-            } else if w == "-o" {
-                let o = a[i + 1];
-                if o.starts_with("StrictHostKeyChecking=") { strict.clear(); strict.append(o[22..]); }
-                else if o.starts_with("UserKnownHostsFile=") { known_hosts_file.clear(); known_hosts_file.append(o[19..]); }
-                else if o.starts_with("Port=") { let v, ok = parse_int(o[5..], 10); if ok { port = v; } }
-                else if o.starts_with("User=") { user.clear(); user.append(o[5..]); }
-                else if o.starts_with("KexAlgorithms=") { algs.append(str("kex ", o[14..], "\n")); }
-                else if o.starts_with("Ciphers=") { algs.append(str("ciphers ", o[8..], "\n")); }
-                else if o.starts_with("MACs=") { algs.append(str("macs ", o[5..], "\n")); }
-                else if o.starts_with("HostKeyAlgorithms=") { algs.append(str("hostkey ", o[18..], "\n")); }
-                else { sysnet::eprint(str("goose-ssh: ignoring option ", o, "\n")); }
+            if w == "-l" {
+                if a[i + 1].len > o.user.cap { return usage(); }
+                o.user.clear();
+                o.user.append(a[i + 1]);
                 i += 2;
             } else if w == "-t" { force_pty = 1; i++; }
             else if w == "-T" { force_pty = -1; i++; }
-            else if w == "-v" { verbose = true; i++; }
             else { return usage(); }
             continue;
         }
@@ -218,52 +154,19 @@ fn run() -> i32 {
         i++;
     }
     if target.len == 0 { return usage(); }
-    // [user@]host[:port]
-    var host: u8[>..] = [];
-    var at = -1;
-    for j in target.len { if target[j] == '@' { at = j; } }
-    if at >= 0 {
-        if user.len == 0 { user.append(target[..at]); }
-        host.append(target[at + 1..]);
-    } else {
-        host.append(target);
-    }
-    if user.len == 0 { user = sysnet::user_name(); }
-    let home = sysnet::home_dir();
-    if known_hosts_file.len == 0 { known_hosts_file.append(str(home, "/.ssh/known_hosts")); }
+    // [user@]host
+    let host = login::split_target(o, target);
+    var cfg = login::config(o, host);
+    let port = o.port;
+    let verbose = o.verbose;
 
-    var cfg = ssh::client_config(user, host, port);
-    var kh: u8[>..] = [];
-    let has_kh = read_file(known_hosts_file, kh);
-    if has_kh { cfg.known_hosts.append(kh[..::min(kh.len, cfg.known_hosts.cap)]); }
-    for line in split(algs, '\n') {
-        let w = words(line);
-        if w.len != 2 { continue; }
-        if w[0] == "kex" { cfg.kex.clear(); cfg.kex.append(w[1]); }
-        if w[0] == "ciphers" { cfg.ciphers.clear(); cfg.ciphers.append(w[1]); }
-        if w[0] == "macs" { cfg.macs.clear(); cfg.macs.append(w[1]); }
-        if w[0] == "hostkey" { cfg.host_key_algs.clear(); cfg.host_key_algs.append(w[1]); }
-    }
-    if strict == "no" { cfg.host_key_check = ssh::HOST_KEY_INSECURE; }
-    else if strict == "yes" { cfg.host_key_check = ssh::HOST_KEY_KNOWN_HOSTS; }
-    else { cfg.host_key_check = ssh::HOST_KEY_ASK; }
-    if keyfiles.len > 0 {
-        for path in split(keyfiles, '\n') { if path.len > 0 { let ok = load_key(cfg, path, true); } }
-    } else {
-        let defaults: const u8[:][3] = ["/.ssh/id_ed25519", "/.ssh/id_ecdsa", "/.ssh/id_rsa"];
-        for d in defaults {
-            let p = str(home, d);
-            if file_exists(p) { let ok = load_key(cfg, p, false); }
-        }
-    }
-
-    log(str("connecting to ", host, " port ", port));
+    login::log(o, str("connecting to ", host, " port ", port));
     let sock = sysnet::net_connect(host, port as! i32);
-    if sock < 0 { return die(str("cannot connect to ", host, " port ", port)); }
+    if sock < 0 { return login::die(o, str("cannot connect to ", host, " port ", port)); }
     var c = ssh::client(cfg);
     var out: u8[>..] = [];
     ssh::client_start(c, cfg, out);
-    if !send_all(sock, out) { return die("write failed"); }
+    if !send_all(sock, out) { return login::die(o, "write failed"); }
     let interactive_stdin = sysnet::tty_is(0) == 1;
     var s = Session { sock: sock, ch: -1, exit: -1, opened: false, done: false, stdin_eof: false,
                       pty: force_pty == 1 || (force_pty == 0 && command.len == 0 && interactive_stdin),
@@ -368,45 +271,21 @@ fn run() -> i32 {
                         sysnet::eprint(str("Allocated port ", bound, " for remote forward to ", w[1], ":", w[2], "\n"));
                     }
                     remote.append(str(bound, " ", w[1], " ", w[2], "\n"));
-                    log(str("remote forward on port ", bound, " to ", w[1], ":", w[2]));
+                    login::log(o, str("remote forward on port ", bound, " to ", w[1], ":", w[2]));
                 } else {
                     sysnet::eprint(str("Warning: remote port forwarding failed for listen port ", w[0], "\n"));
                 }
                 continue;
             }
-            if e.kind == ssh::EV_HOST_KEY_UNKNOWN {
-                let k, okk = ssh::parse_public_key(d);
-                var yes = strict == "accept-new";
-                if !yes {
-                    sysnet::eprint(str("The authenticity of host '", ssh::known_host_name(cfg), "' can't be established.\n",
-                                       ssh::key_type(k.kind), " key fingerprint is ", ssh::fingerprint_sha256(k), ".\n"));
-                    let answer = sysnet::ask_line("Are you sure you want to continue connecting (yes/no)? ");
-                    yes = answer == "yes";
-                }
-                if !yes {
-                    ssh::disconnect(c, out);
-                    let w = send_all(sock, out);
-                    return die("host key verification failed");
-                }
-                let line = ssh::known_hosts_line(cfg, k, false);
-                if append_file(known_hosts_file, line) {
-                    sysnet::eprint(str("Warning: Permanently added '", ssh::known_host_name(cfg), "' (", ssh::key_type(k.kind),
-                                       ") to the list of known hosts.\n"));
-                }
-                var more: u8[>..] = [];
-                let r = ssh::host_key_accept(c, cfg, out, more);
-                events.append(more);
-            } else if e.kind == ssh::EV_HOST_KEY {
-                let k, okk = ssh::parse_public_key(d);
-                log(str("host key ", ssh::key_type(k.kind), " ", ssh::fingerprint_sha256(k), "; ", c.kex_name, ", ",
-                        c.cipher_c2s, if c.strict { ", strict kex" } else { "" }));
-            } else if e.kind == ssh::EV_BANNER {
-                sysnet::eprint(d);
-            } else if e.kind == ssh::EV_PASSWORD_NEEDED {
-                let pw = sysnet::secret(str(user, "@", host, "'s password: "));
-                let ok2 = ssh::client_password(c, cfg, pw, out);
+            let le = login::login_event(o, cfg, c, e, events, out);
+            if le < 0 {
+                let w = send_all(sock, out);
+                return login::die(o, "host key verification failed");
+            }
+            if le > 0 {
+                continue;
             } else if e.kind == ssh::EV_AUTHENTICATED {
-                log(str("authenticated as ", user));
+                login::log(o, str("authenticated as ", o.user));
                 for line in split(forwards, '\n') {
                     let w = words(line);
                     if w.len != 5 { continue; }
@@ -421,7 +300,7 @@ fn run() -> i32 {
                     let kind = if w[0] == "L" { relay::FWD_LOCAL } else { relay::FWD_DYNAMIC };
                     if relay::listen(rl, kind, bind, fp, w[3], hp) {
                         let what: u8[>..] = if w[0] == "L" { str(" for ", w[3], ":", hp) } else { " (SOCKS)" };
-                        log(str("listening on ", bind, ":", fp, what));
+                        login::log(o, str("listening on ", bind, ":", fp, what));
                     } else {
                         sysnet::eprint(str("goose-ssh: cannot listen on ", bind, " port ", fp, "\n"));
                     }
@@ -478,7 +357,7 @@ fn run() -> i32 {
     }
     if s.raw { sysnet::tty_restore(0); }
     sysnet::net_close(sock);
-    if ssh::failed(c) { return die(str("connection failed: ", c.message)); }
+    if ssh::failed(c) { return login::die(o, str("connection failed: ", c.message)); }
     if s.failed { return 255; }
     return if s.exit >= 0 { s.exit as! i32 } else { 255 };
 }
