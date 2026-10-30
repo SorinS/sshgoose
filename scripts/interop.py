@@ -27,6 +27,14 @@ as this user (its own config, DH and ssh-rsa enabled again, since OpenSSH
   goose-ssh's -L, -D (SOCKS5) and -R through OpenSSH sshd and goose-sshd,
   -L and -D through Go's server; OpenSSH ssh's -L, -D, -R and -R with port
   0 through goose-sshd; Go's client's direct-tcpip through goose-sshd.
+- SFTP: scripts/sftp_raw.py's requests to goose-sftp-server and OpenSSH's
+  sftp-server, their replies compared; one sftp batch (put, get, reput,
+  reget, -r, mkdir, rename, ln, chmod, df, errors) through `sftp -D` to
+  each, the transcripts and the trees left compared; goose-scp to
+  goose-sshd, to OpenSSH sshd with its sftp-server and to OpenSSH sshd with
+  goose-sftp-server (5 MB and empty files both ways, -r, -p, several
+  sources, a pattern, ~ and relative paths, and refusals); OpenSSH scp and
+  sftp to goose-sshd and to goose-sftp-server under OpenSSH sshd.
 
     python3 scripts/interop.py [--goose PATH]
 """
@@ -77,6 +85,18 @@ def find_sshd():
     return "/usr/sbin/sshd"
 
 
+def find_sftp_server():
+    # $SFTP_SERVER, else the one beside sshd (libexec), else the usual places.
+    if os.environ.get("SFTP_SERVER"):
+        return os.environ["SFTP_SERVER"]
+    sshd = os.path.realpath(find_sshd())
+    for cand in (os.path.join(os.path.dirname(os.path.dirname(sshd)), "libexec", "sftp-server"),
+                 "/usr/libexec/sftp-server", "/usr/lib/openssh/sftp-server", "/usr/libexec/openssh/sftp-server"):
+        if os.path.isfile(cand):
+            return cand
+    sys.exit("no OpenSSH sftp-server found: set SFTP_SERVER")
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -106,7 +126,8 @@ def main():
         os.environ.get("GOOSE") or shutil.which("goose") or os.path.join(ROOT, "..", "goose.git", "build", "goose")
     t = tempfile.mkdtemp()
     k = lambda name: os.path.join(t, name)
-    for tool, out in (("ssh.goose", "goose-ssh"), ("sshd.goose", "goose-sshd"), ("keygen.goose", "goose-ssh-keygen")):
+    for tool, out in (("ssh.goose", "goose-ssh"), ("sshd.goose", "goose-sshd"), ("keygen.goose", "goose-ssh-keygen"),
+                      ("sftp_server.goose", "goose-sftp-server"), ("scp.goose", "goose-scp")):
         subprocess.run([goose, "build", "-o", k(out), os.path.join(ROOT, "tools", tool)], check=True, capture_output=True)
     subprocess.run(["go", "build", "-o", k("gossh"), "."], cwd=os.path.join(ROOT, "tools", "gossh"), check=True,
                    env=GO_ENV)
@@ -182,27 +203,34 @@ def main():
                      timeout=10)
     check("sshd: a host key file too long is refused", rc != 0 and b"too long" in err, err.decode())
 
-    # The three servers.
-    p_openssh, p_goose, p_go = free_port(), free_port(), free_port()
-    with open(k("sshd_config"), "w") as f:
-        f.write(f"Port {p_openssh}\nListenAddress 127.0.0.1\nHostKey {k('host_ed25519')}\nHostKey {k('host_ecdsa')}\n"
-                f"HostKey {k('host_rsa')}\nAuthorizedKeysFile {k('authorized_keys')}\nPidFile {k('sshd.pid')}\n"
-                "UsePAM no\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
-                "KexAlgorithms +diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group14-sha1\n"
-                "MACs +hmac-sha1\nHostKeyAlgorithms +ssh-rsa\n")
+    # The servers: OpenSSH's sshd (with its sftp-server), goose-sshd (with
+    # goose-sftp-server, found beside it), Go's; and a second OpenSSH sshd
+    # whose sftp subsystem is goose-sftp-server.
+    p_openssh, p_goose, p_go, p_osftp = free_port(), free_port(), free_port(), free_port()
+    sftp_server = find_sftp_server()
+    for conf, port, sub, pid in (("sshd_config", p_openssh, sftp_server, "sshd.pid"),
+                                 ("sshd_config_gsftp", p_osftp, k("goose-sftp-server"), "sshd2.pid")):
+        with open(k(conf), "w") as f:
+            f.write(f"Port {port}\nListenAddress 127.0.0.1\nHostKey {k('host_ed25519')}\nHostKey {k('host_ecdsa')}\n"
+                    f"HostKey {k('host_rsa')}\nAuthorizedKeysFile {k('authorized_keys')}\nPidFile {k(pid)}\n"
+                    "UsePAM no\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+                    "KexAlgorithms +diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group14-sha1\n"
+                    f"MACs +hmac-sha1\nHostKeyAlgorithms +ssh-rsa\nSubsystem sftp {sub}\n")
     servers = [subprocess.Popen([find_sshd(), "-D", "-f", k("sshd_config"), "-E", k("sshd.log")]),
+               subprocess.Popen([find_sshd(), "-D", "-f", k("sshd_config_gsftp"), "-E", k("sshd2.log")]),
                subprocess.Popen([k("goose-sshd"), "-p", str(p_goose), "-h", k("host_ed25519"), "-k", k("authorized_keys"),
                                  "-P", k("passwords")], stderr=subprocess.DEVNULL),
                subprocess.Popen([k("gossh"), "server", str(p_go), k("host_ecdsa"), k("authorized_keys"), "gopw"],
                                 stdout=subprocess.DEVNULL)]
     try:
-        for p in (p_openssh, p_goose, p_go):
+        for p in (p_openssh, p_goose, p_go, p_osftp):
             if not wait_port(p):
                 sys.exit(f"a server did not start on port {p}")
         known = {p_openssh: f"[127.0.0.1]:{p_openssh} {pub('host_ed25519')}\n"
                             f"[127.0.0.1]:{p_openssh} {pub('host_ecdsa')}\n[127.0.0.1]:{p_openssh} {pub('host_rsa')}\n",
                  p_goose: f"[127.0.0.1]:{p_goose} {pub('host_ed25519')}\n",
-                 p_go: f"[127.0.0.1]:{p_go} {pub('host_ecdsa')}\n"}
+                 p_go: f"[127.0.0.1]:{p_go} {pub('host_ecdsa')}\n",
+                 p_osftp: f"[127.0.0.1]:{p_osftp} {pub('host_ed25519')}\n"}
         with open(k("known_hosts"), "w") as f:
             f.write("".join(known.values()))
 
@@ -436,12 +464,220 @@ def main():
                      allocated=True)
         rc, out, err = run([k("gossh"), "dial", str(p_goose), USER, k("user_ed25519"), hk, f"127.0.0.1:{p_http}", "/file.bin"])
         check("Go client direct-tcpip through goose-sshd", out == f"{len(page)} {page_digest}\n".encode(), (rc, out, err))
+
+        sftp_cases(k, sftp_server, {p_goose: "goose-sshd", p_openssh: "OpenSSH sshd + sftp-server",
+                                    p_osftp: "OpenSSH sshd + goose-sftp-server"})
     finally:
         for s in servers:
             s.kill()
         shutil.rmtree(t, ignore_errors=True)
     print(f"\n{sum(results)} passed, {len(results) - sum(results)} failed")
     sys.exit(0 if all(results) else 1)
+
+
+# --- SFTP ------------------------------------------------------------------------
+
+SFTP_BATCH = """cd {srv}
+put {loc}/big
+put {loc}/small
+put {loc}/empty
+-put {loc}/nosuch
+mkdir d1
+-mkdir d1
+rename small d1/small2
+-rename empty d1/small2
+ln -s big biglink
+ln big bighard
+chmod 600 big
+ls -l
+ls -la d1
+ls -n
+get big {loc}/back/big
+get d1/small2 {loc}/back/small
+-get nosuch {loc}/back/nosuch
+put -r {loc}/tree
+get -r tree {loc}/back/tree
+!head -c 100000 {loc}/big > {loc}/half
+put {loc}/half big2
+reput {loc}/big big2
+get big2 {loc}/back/big2
+!head -c 5000 {loc}/big > {loc}/back/big3
+reget big {loc}/back/big3
+rm big2
+-cd nosuch
+-rmdir tree
+-rm nosuch
+mkdir ro
+chmod 500 ro
+-put {loc}/small ro/x
+chmod 700 ro
+rmdir ro
+rm biglink
+rm bighard
+-rename big d1/small2
+ls -l d1
+symlink d1 dlink
+ls -l
+pwd
+df
+"""
+
+
+def sftp_batch(server, d):
+    """The batch through `sftp -D server` in d: its exit status, transcript
+    (d as "D", times and directories' sizes left out) and the tree left."""
+    srv, loc = os.path.join(d, "srv"), os.path.join(d, "loc")
+    os.makedirs(srv)
+    os.makedirs(os.path.join(loc, "back"))
+    os.makedirs(os.path.join(loc, "tree", "sub"))
+    with open(os.path.join(loc, "big"), "wb") as f:
+        f.write(bytes(range(256)) * 12000)
+    with open(os.path.join(loc, "small"), "w") as f:
+        f.write("hello\n")
+    open(os.path.join(loc, "empty"), "w").close()
+    with open(os.path.join(loc, "tree", "a"), "w") as f:
+        f.write("a\n")
+    with open(os.path.join(loc, "tree", "sub", "b"), "w") as f:
+        f.write("b\n")
+    os.chmod(os.path.join(loc, "tree", "a"), 0o640)
+    batch = os.path.join(d, "..", os.path.basename(d) + ".batch")
+    with open(batch, "w") as f:
+        f.write(SFTP_BATCH.format(srv=srv, loc=loc))
+    p = subprocess.run(["sftp", "-D", server, "-b", batch], capture_output=True, text=True, timeout=120)
+    lines = []
+    for l in (p.stdout + p.stderr).replace(d, "D").splitlines():
+        w = l.split()
+        if len(w) >= 9 and len(w[0]) == 10 and w[0][0] in "-dl":
+            if w[0][0] == "d":
+                w[4] = "DIRSIZE"
+            w[5:8] = ["TIME"]
+            l = " ".join(w)
+        elif w and l.startswith(" ") and all(x.rstrip("%").isdigit() for x in w):
+            l = "DF"                                   # df's numbers move as the file system does
+        lines.append(l)
+    tree = set()
+    for root, dirs, files in os.walk(d):
+        for n in dirs + files:
+            pth = os.path.join(root, n)
+            st = os.lstat(pth)
+            if stat.S_ISREG(st.st_mode):
+                body = hashlib.sha256(open(pth, "rb").read()).hexdigest()
+            else:
+                body = os.readlink(pth) if stat.S_ISLNK(st.st_mode) else ""
+            tree.add((os.path.relpath(pth, d), oct(st.st_mode), 0 if stat.S_ISDIR(st.st_mode) else st.st_nlink, body))
+    return p.returncode, lines, tree
+
+
+def sftp_cases(k, sftp_server, servers):
+    # The raw requests, compared reply by reply.
+    rc, out, err = run([sys.executable, os.path.join(ROOT, "scripts", "sftp_raw.py"), k("goose-sftp-server"), sftp_server],
+                       timeout=300)
+    for line in out.decode().splitlines():
+        if line.startswith(("ok    ", "FAIL  ")):
+            check("sftp raw: " + line[6:].split("  ")[0], line.startswith("ok"), line[6:])
+    check("sftp raw: the script ran", rc in (0, 1) and b"passed" in out, err.decode()[-500:])
+
+    # One sftp batch through each server.
+    base = os.path.join(k("sftp_batch"))
+    os.makedirs(base)
+    a = sftp_batch(sftp_server, os.path.join(base, "openssh"))
+    b = sftp_batch(k("goose-sftp-server"), os.path.join(base, "goose"))
+    check("sftp -D batch: both run to the end", a[0] == 0 and b[0] == 0, (a[0], b[0], b[1][-5:]))
+    check("sftp -D batch: the same transcript", a[1] == b[1],
+          [x for x in __import__("difflib").unified_diff(a[1], b[1], lineterm="", n=0)][:20])
+    check("sftp -D batch: the same files left", a[2] == b[2], (sorted(a[2] - b[2])[:5], sorted(b[2] - a[2])[:5]))
+
+    # goose-scp, and OpenSSH's scp and sftp, to each server.
+    f5m = k("f5m")
+    with open(f5m, "wb") as f:
+        f.write(os.urandom(5 * 1024 * 1024))
+    with open(k("small1"), "w") as f:
+        f.write("hi\n")
+    tree = k("tree")
+    os.makedirs(os.path.join(tree, "sub", "deeper"))
+    for rel, body, mode in (("a", "a\n", 0o640), ("sub/b", "b" * 70000, 0o600), ("sub/deeper/c", "", 0o755)):
+        with open(os.path.join(tree, rel), "w") as f:
+            f.write(body)
+        os.chmod(os.path.join(tree, rel), mode)
+    os.utime(os.path.join(tree, "sub", "b"), (1500000000, 1577934240))
+    home = os.path.expanduser("~")
+
+    def same_tree(x, y, times=False):
+        for root, dirs, files in os.walk(x):
+            for n in files:
+                p = os.path.join(root, n)
+                q = os.path.join(y, os.path.relpath(p, x))
+                if not os.path.isfile(q) or open(p, "rb").read() != open(q, "rb").read():
+                    return False
+                if times and (int(os.stat(p).st_mtime) != int(os.stat(q).st_mtime) or
+                              stat.S_IMODE(os.stat(p).st_mode) != stat.S_IMODE(os.stat(q).st_mode)):
+                    return False
+        return True
+
+    def same(p, q):
+        return os.path.isfile(q) and open(p, "rb").read() == open(q, "rb").read()
+
+    for port, name in servers.items():
+        g = [k("goose-scp"), "-P", str(port), "-i", k("user_ed25519"), "-o", f"UserKnownHostsFile={k('known_hosts')}",
+             "-o", "StrictHostKeyChecking=yes"]
+        w = k(f"scp_{port}")
+        dl = os.path.join(w, "dl")
+        os.makedirs(dl)
+        r = lambda *a: run([*g, *a], timeout=120)
+        rc, _, err = r(f5m, f"127.0.0.1:{w}/up")
+        check(f"goose-scp to {name}: 5 MB up", rc == 0 and same(f5m, f"{w}/up"), (rc, err))
+        rc, _, err = r(f"127.0.0.1:{w}/up", f"{dl}/back")
+        check(f"goose-scp to {name}: 5 MB down", rc == 0 and same(f5m, f"{dl}/back"), (rc, err))
+        open(f"{w}/empty0", "w").close()
+        rc, _, err = r(f"{w}/empty0", f"127.0.0.1:{w}/emptyup")
+        rc2, _, err2 = r(f"127.0.0.1:{w}/emptyup", f"{dl}/e")
+        check(f"goose-scp to {name}: an empty file up and down", rc == 0 and rc2 == 0 and os.path.getsize(f"{dl}/e") == 0,
+              (rc, rc2, err, err2))
+        rc, _, err = r("-rp", tree, f"127.0.0.1:{w}/tree")
+        check(f"goose-scp to {name}: -rp up, times and modes kept", rc == 0 and same_tree(tree, f"{w}/tree", True), (rc, err))
+        rc, _, err = r("-rp", f"127.0.0.1:{w}/tree", dl + "/")
+        check(f"goose-scp to {name}: -rp down into a directory", rc == 0 and same_tree(tree, f"{dl}/tree", True), (rc, err))
+        rc, _, err = r("-r", tree, f"127.0.0.1:{w}/tree")
+        check(f"goose-scp to {name}: -r onto a directory there: inside it", rc == 0 and same_tree(tree, f"{w}/tree/tree"),
+              (rc, err))
+        rc, _, err = r(f5m, k("small1"), f"127.0.0.1:{w}/")
+        check(f"goose-scp to {name}: two sources into a directory",
+              rc == 0 and same(f5m, f"{w}/f5m") and same(k("small1"), f"{w}/small1"), (rc, err))
+        rc, _, err = r(f5m, k("small1"), f"127.0.0.1:{w}/up")
+        check(f"goose-scp to {name}: two sources, the target no directory: refused", rc == 1 and same(f5m, f"{w}/up"),
+              (rc, err))
+        rc, _, err = r(f"127.0.0.1:{w}/*1", f"127.0.0.1:{w}/f5?", dl)
+        check(f"goose-scp to {name}: patterns", rc == 0 and same(k("small1"), f"{dl}/small1") and same(f5m, f"{dl}/f5m"),
+              (rc, err))
+        rc, _, err = r(f"127.0.0.1:{w}/nosuch", dl)
+        check(f"goose-scp to {name}: a missing source: status 1", rc == 1 and b"nosuch" in err, (rc, err))
+        rc, _, err = r(tree, f"127.0.0.1:{w}/x")
+        check(f"goose-scp to {name}: a directory without -r refused", rc == 1 and not os.path.exists(f"{w}/x"), (rc, err))
+        os.makedirs(f"{w}/ro")
+        os.chmod(f"{w}/ro", 0o500)
+        rc, _, err = r(k("small1"), f"127.0.0.1:{w}/ro/x")
+        os.chmod(f"{w}/ro", 0o700)
+        check(f"goose-scp to {name}: an unwritable destination: status 1", rc == 1 and b"ermission denied" in err, (rc, err))
+        rel = f"goose_scp_interop_{port}"
+        rc, _, err = r(k("small1"), f"127.0.0.1:{rel}")
+        check(f"goose-scp to {name}: a relative path: in the home directory", rc == 0 and same(k("small1"), f"{home}/{rel}"),
+              (rc, err))
+        rc, _, err = r(f"127.0.0.1:~/{rel}", f"{dl}/tilde")
+        check(f"goose-scp to {name}: ~/path", rc == 0 and same(k("small1"), f"{dl}/tilde"), (rc, err))
+        if os.path.exists(f"{home}/{rel}"):
+            os.remove(f"{home}/{rel}")
+        o = ["-o", f"UserKnownHostsFile={k('known_hosts')}", "-o", "StrictHostKeyChecking=yes", "-o", "IdentitiesOnly=yes",
+             "-o", "BatchMode=yes", "-i", k("user_ed25519"), "-P", str(port)]
+        if name == "OpenSSH sshd + sftp-server":
+            continue                         # OpenSSH's client and server together are not ours to test
+        rc, _, err = run(["scp", "-q", *o, "-rp", tree, f"127.0.0.1:{w}/otree"], timeout=120)
+        check(f"OpenSSH scp to {name}: -rp up", rc == 0 and same_tree(tree, f"{w}/otree", True), (rc, err))
+        rc, _, err = run(["scp", "-q", *o, f"127.0.0.1:{w}/up", f"{dl}/oback"], timeout=120)
+        check(f"OpenSSH scp to {name}: 5 MB down", rc == 0 and same(f5m, f"{dl}/oback"), (rc, err))
+        batch = f"cd {w}\nput {f5m} sftp_up\nget sftp_up {dl}/sftp_back\nmkdir sd\nrename sftp_up sd/u\nls sd\nrm sd/u\nrmdir sd\n"
+        rc, out, err = run(["sftp", *o[:-2], "-P", str(port), "-b", "-", "127.0.0.1"], stdin=batch.encode(), timeout=120)
+        check(f"OpenSSH sftp to {name}: a batch", rc == 0 and same(f5m, f"{dl}/sftp_back") and b"sd/u" in out and
+              not os.path.exists(f"{w}/sd"), (rc, out[-300:], err))
 
 
 if __name__ == "__main__":

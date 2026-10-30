@@ -5,8 +5,9 @@ SSH (RFC 4251-4254) for the Goose language, as Go's
 cryptography and [x509](../x509goose.git) and [asn1](../asn1goose.git) for
 key files. Nothing here does I/O.
 
-Three programs come with it: `goose-ssh`, a client, `goose-sshd`, a
-server, and `goose-ssh-keygen` (see below).
+Five programs come with it: `goose-ssh`, a client, `goose-sshd`, a
+server, `goose-scp` and `goose-sftp-server`, and `goose-ssh-keygen` (see
+below).
 
 - **`ssh`**: message numbers, the wire encoding (integers, strings, mpints,
   name-lists, RFC 4251 §5) and algorithm negotiation.
@@ -48,6 +49,12 @@ server, and `goose-ssh-keygen` (see below).
   global requests and their replies, and port forwarding's channels and
   requests (direct-tcpip, tcpip-forward, cancel-tcpip-forward,
   forwarded-tcpip, RFC 4254 §7), the application connecting and listening.
+- **`ssh.sftp`**: the SSH File Transfer Protocol, version 3
+  (draft-ietf-secsh-filexfer-02) as OpenSSH speaks it, without I/O: every
+  request and reply written and read back, attributes, status codes, packet
+  framing (at most 256 KiB, as OpenSSH), extensions named in VERSION, and
+  ls -l longnames. Where OpenSSH departs from the draft it follows OpenSSH:
+  SYMLINK takes the target first.
 
 ## The programs
 
@@ -56,10 +63,13 @@ cd tools
 goose build -o goose-ssh ssh.goose
 goose build -o goose-sshd sshd.goose
 goose build -o goose-ssh-keygen keygen.goose
+goose build -o goose-scp scp.goose
+goose build -o goose-sftp-server sftp_server.goose
 
 ./goose-sshd -p 2222                       # 127.0.0.1:2222, ~/.ssh/authorized_keys
 ./goose-ssh -p 2222 localhost              # an interactive shell
 ./goose-ssh user@host.example.com uname -a # a command, its exit status ours
+./goose-scp -P 2222 -rp dir localhost:     # a directory to the home directory there
 ```
 
 `goose-ssh` works as OpenSSH's `ssh` is used: `[user@]host`, `-p`, `-l`,
@@ -86,12 +96,48 @@ refused), `-k authorized_keys` (`~/.ssh/authorized_keys`; a line with
 options, `command=`, `from=`, `restrict` and the like, lets nobody in,
 since they are not enforced), `-P
 password_file` ("user:password" lines, plain or bcrypt), `-u user`,
-`-b banner`, `-g`, `-v`. Each connection is a process of its own; a session
-runs a command or the user's shell, on a pty when asked, and ends with its
-exit status. It connects the client's -L and -D channels to their targets,
+`-b banner`, `-s sftp_server` (by default `goose-sftp-server` beside
+goose-sshd), `-g`, `-v`. Each connection is a process of its own; a session
+runs a command or the user's shell, on a pty when asked, in the user's home
+directory, and ends with its exit status; the `sftp` subsystem runs the
+SFTP server. It connects the client's -L and -D channels to their targets,
 and listens for -R on the loopback address (on the address asked for with
 `-g`, as OpenSSH's GatewayPorts). tools/net.c is their operating-system part (sockets, the terminal,
-processes), for macOS and Linux.
+processes), and tools/fs.c the file system's, for macOS and Linux.
+
+`goose-scp` copies files as OpenSSH's scp does by default (over SFTP):
+`[-r] [-p] [-q] [-v] [-P port] [-i keyfile] [-o option=value] source...
+target`, a remote file being `[user@]host:path`, with goose-ssh's login,
+keys, known_hosts and `-o` options. All the sources are local and the
+target remote, or the sources are on one host and the target local; a
+target that is a directory takes each source by its name, and several
+sources need one. A remote path starts from the home directory, `~` is
+expanded by the server (expand-path@openssh.com), and a remote source's last
+part may be a pattern (`*`, `?`, `[...]`). `-r` copies directories,
+following symbolic links; `-p` keeps times and modes (otherwise a new file
+gets its source's mode under the umask, as scp). Transfers keep 64 requests
+of 32 KiB in flight, as OpenSSH's. A file that fails is reported and the
+others still copied; the status is then 1. Not supported: copies between
+two remote hosts, the legacy scp protocol (`-O`; OpenSSH's `scp -O` to
+goose-sshd works through the remote `scp`), the progress meter (`-q` is
+taken and changes nothing), `-l`, `-3`, `-J`.
+
+`goose-sftp-server` serves SFTP on stdin and stdout as OpenSSH's
+sftp-server, with the user's own file access: goose-sshd runs it, and so
+can OpenSSH's sshd (`Subsystem sftp /path/goose-sftp-server`). Its
+extensions are OpenSSH's (posix-rename, statvfs, fstatvfs, hardlink, fsync,
+lsetstat, limits, expand-path, users-groups-by-id, copy-data,
+home-directory), at the versions OpenSSH gives them. It answers as
+OpenSSH's does, request for request (`scripts/sftp_raw.py`, below), except
+where OpenSSH's ends the session or does not answer: a request that does
+not parse, or whose path holds a NUL, gets a bad message; an unknown packet
+type gets "unsupported", as the draft has it (OpenSSH's sends nothing). RENAME
+does not replace a file, as the draft says (a link, then an unlink, as
+OpenSSH); posix-rename@openssh.com does. REALPATH takes a path whose last
+part does not exist yet, as OpenSSH's (OpenBSD's realpath). At most 64
+handles are open at once, each named by its slot and a generation, so a
+closed handle never names the slot's next use. `-e` or `-v` logs requests
+to stderr.
 
 `goose-ssh-keygen` makes key files as ssh-keygen does: `-t ed25519`
 (the default), `ecdsa` (`-b 256`, `384`, `521`) or `rsa` (`-b`, 3072),
@@ -145,13 +191,20 @@ on free ports of 127.0.0.1, and leaves nothing running.
   window that lets in one window and then only what was used; window
   adjustments wanted during either side's rekey held until its NEWKEYS;
   a rekey started by sending alone (global requests, no input).
+- `sftp`: every SFTP request and reply written and read back field by
+  field, INIT and READ and ATTRS byte for byte, SYMLINK in OpenSSH's order,
+  STATUS with OpenSSH's messages (and without a language tag), NAME's
+  count, attributes with each field and extended pairs skipped, truncated
+  ones refused at every length, packet framing (partial, two at once,
+  empty, one byte over 256 KiB), ls -l longnames (set-id and sticky bits,
+  recent and old dates) and dates from day counts.
 - `forward`: port forwarding in memory: direct-tcpip with its target and
   originator, data, EOF and close, and a refused one; tcpip-forward on port
   0 and the port in the reply; forwarded-tcpip channels from the server;
   cancel-tcpip-forward; an unknown global request refused; replies in
   order; 40 channels at once.
 
-`scripts/interop.py` runs live connections on 127.0.0.1 (196 cases):
+`scripts/interop.py` runs live connections on 127.0.0.1 (352 cases):
 goose-ssh against an OpenSSH sshd (10.3, run as the user, with DH and
 ssh-rsa enabled again), Go's x/crypto/ssh server and goose-sshd, with
 every key exchange, cipher and MAC, every host key type, Ed25519 and RSA
@@ -168,6 +221,19 @@ ssh-keygen's ChaCha20-Poly1305 and AES-GCM ones by goose-ssh, a wrong
 passphrase refused; goose-ssh-keygen's keys under every cipher read by
 ssh-keygen (and by Go, for the AES-256 CTR and CBC ones it reads), and
 its fingerprints equal to ssh-keygen's.
+
+And SFTP: `scripts/sftp_raw.py` sends goose-sftp-server and OpenSSH's
+sftp-server the same 100 requests, byte by byte, and compares their replies
+(stale and malformed handles, EXCL and APPEND, reads past the end and cut
+at the limit, links, RENAME onto a file and posix-rename, directories, NUL
+and over-long paths, every attribute, every extension); one `sftp -D` batch
+(put, get, reput, reget, -r, rename, ln, chmod, df, failures) to each,
+transcripts and trees compared; goose-scp to goose-sshd, to OpenSSH sshd
+with its sftp-server and to OpenSSH sshd with goose-sftp-server (5 MB and
+empty files both ways, -rp with times and modes, into a directory, several
+sources, patterns, `~` and relative paths, a missing source, a directory
+without -r, an unwritable destination); OpenSSH's scp -rp and an sftp batch
+to goose-sshd and to goose-sftp-server.
 
 `tools/gossh` builds offline from the module cache
 (`GOFLAGS=-mod=mod GOPROXY=off GOSUMDB=off`).
