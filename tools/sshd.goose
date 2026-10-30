@@ -2,7 +2,7 @@
 // running it:
 //
 //   goose-sshd [-p port] [-a address] [-h host_key_file]... [-k authorized_keys]
-//              [-P password_file] [-u user] [-b banner] [-g] [-v]
+//              [-P password_file] [-u user] [-b banner] [-s sftp_server] [-g] [-v]
 //
 // It listens on 127.0.0.1:2222 by default (-a 0.0.0.0 for every address),
 // with the host keys given (by default ./goose_host_ed25519_key, made on
@@ -13,7 +13,9 @@
 // or a bcrypt hash). Each connection runs in its own process. A session
 // runs a command (exec) or the user's shell (shell), on a pseudo-terminal
 // when the client asks for one (pty-req, then window-change), with the
-// environment the client sends (env), and ends with the exit status.
+// environment the client sends (env), in the user's home directory, and
+// ends with the exit status. The "sftp" subsystem runs the SFTP server
+// (-s, by default goose-sftp-server beside this program) in the same way.
 // Port forwarding: direct-tcpip channels (the client's -L and -D) are
 // connected to their target; tcpip-forward (-R) listens on the loopback
 // address (on any address the client names with -g, as OpenSSH's
@@ -32,11 +34,12 @@ import .relay;
 
 var verbose = false;
 var gateway_ports = false;
+var sftp_server: u8[>..] = [];
 
 fn log(s: const u8[:]) { if verbose { sysnet::eprint(str("goose-sshd: ", s, "\n")); } }
 
 fn usage() {
-    sysnet::eprint("usage: goose-sshd [-p port] [-a address] [-h host_key_file]... [-k authorized_keys] [-P password_file] [-u user] [-b banner] [-g] [-v]\n");
+    sysnet::eprint("usage: goose-sshd [-p port] [-a address] [-h host_key_file]... [-k authorized_keys] [-P password_file] [-u user] [-b banner] [-s sftp_server] [-g] [-v]\n");
     exit(1);
 }
 
@@ -290,6 +293,19 @@ fn handle_connection(sock: i32, cfg: const ssh::ServerConfig&, peer: const u8[:]
                     let how: u8[>..] = if s.want_pty { " on a pty" } else { "" };
                     log(str(what, how));
                     ok2 = spawn(s, cmd);
+                } else if k == "subsystem" && s.pid < 0 {
+                    let name = ssh::get_string(r, events);
+                    let nm = ssh::bytes(events, name);
+                    log(str("subsystem ", nm));
+                    // Only sftp, run as the shell's one word: the path quoted.
+                    if !r.bad && nm == "sftp" {
+                        var cmd: u8[>..] = [];
+                        cmd.push('\'');
+                        for ch in sftp_server { if ch == '\'' { cmd.append("'\\''"); } else { cmd.push(ch); } }
+                        cmd.push('\'');
+                        s.want_pty = false;
+                        ok2 = spawn(s, cmd);
+                    }
                 } else if k == "window-change" && s.master >= 0 {
                     let cols = ssh::get_u32(r, events);
                     let rows = ssh::get_u32(r, events);
@@ -406,9 +422,11 @@ fn main() {
         else if w == "-P" { passwords.clear(); passwords.append(a[i + 1]); }
         else if w == "-u" { user.clear(); user.append(a[i + 1]); }
         else if w == "-b" { banner.clear(); banner.append(a[i + 1]); }
+        else if w == "-s" { sftp_server.clear(); sftp_server.append(a[i + 1]); }
         else { usage(); }
         i += 2;
     }
+    if sftp_server.len == 0 { sftp_server.append(str(resource_dir(), "goose-sftp-server")); }
     var cfg = ssh::server_config();
     if keyfiles.len == 0 { keyfiles.append("goose_host_ed25519_key\n"); }
     for path in split(keyfiles, '\n') {
