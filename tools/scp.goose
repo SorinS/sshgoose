@@ -2,7 +2,7 @@
 // OpenSSH's scp does by default since 9.0:
 //
 //   goose-scp [-r] [-p] [-q] [-v] [-P port] [-i keyfile]... [-o option=value]...
-//             source... target
+//             [-J [user@]host[:port][,...]] source... target
 //
 // A remote file is [user@]host:path (an IPv6 host in brackets); a path
 // with a slash before its first colon is local. All the sources are local
@@ -14,7 +14,7 @@
 // -r copies directories, following symbolic links; -p keeps modification
 // and access times and modes (without it a new file gets its source's
 // mode, as the umask allows). The login is goose-ssh's (-P is the port, -i
-// keys, -o options, known_hosts). Files that fail are reported and the
+// keys, -o options, known_hosts, -J jump hosts and ProxyCommand). Files that fail are reported and the
 // rest still copied; the exit status is 1 if any failed. Not supported:
 // a copy between two remote hosts, the legacy scp protocol (-O), the
 // progress meter (-q is taken and does nothing).
@@ -43,7 +43,8 @@ var errors = 0;
 
 // The connection, and where the session is.
 struct Link {
-    sock: i32, ch: i64, ready: bool, gone: bool,
+    sock: i32, wsock: i32,          // read from, written to: one socket, or a proxy's pipes
+    ch: i64, ready: bool, gone: bool,
     expand: bool,                   // the server has expand-path@openssh.com
     preserve: bool, deep: bool,
 }
@@ -75,7 +76,7 @@ fn pump(o: const login::Options&, cfg: ssh::ClientConfig&, c: ssh::Conn&, l: Lin
             tx.append(rest);
         }
     }
-    if !send_all(l.sock, out) { l.gone = true; return false; }
+    if !send_all(l.wsock, out) { l.gone = true; return false; }
     var fds: i32[1] = [l.sock];
     var flags: u8[1] = [0];
     let nready = sysnet::net_poll_set(fds, flags, wait_ms);
@@ -91,7 +92,7 @@ fn pump(o: const login::Options&, cfg: ssh::ClientConfig&, c: ssh::Conn&, l: Lin
         if !ok { break; }
         let le = login::login_event(o, cfg, c, e, events, out);
         if le < 0 {
-            let w = send_all(l.sock, out);
+            let w = send_all(l.wsock, out);
             sysnet::eprint(str(o.prog, ": host key verification failed\n"));
             l.gone = true;
             return false;
@@ -121,7 +122,7 @@ fn pump(o: const login::Options&, cfg: ssh::ClientConfig&, c: ssh::Conn&, l: Lin
             l.gone = true;
         }
     }
-    if !send_all(l.sock, out) { l.gone = true; return false; }
+    if !send_all(l.wsock, out) { l.gone = true; return false; }
     if ssh::failed(c) {
         sysnet::eprint(str(o.prog, ": connection failed: ", c.message, "\n"));
         l.gone = true;
@@ -651,7 +652,7 @@ fn unbracket(host: const u8[:]) -> u8[>..] {
 }
 
 fn usage(o: const login::Options&) -> i32 {
-    sysnet::eprint("usage: goose-scp [-r] [-p] [-q] [-v] [-P port] [-i keyfile]... [-o option=value]... source... target\n");
+    sysnet::eprint("usage: goose-scp [-r] [-p] [-q] [-v] [-P port] [-i keyfile]... [-o option=value]... [-J jump] source... target\n");
     return 1;
 }
 
@@ -717,18 +718,18 @@ fn run() -> i32 {
     var cfg = login::config(o, host);
 
     login::log(o, str("connecting to ", host, " port ", o.port));
-    let sock = sysnet::net_connect(host, o.port as! i32);
-    if sock < 0 { sysnet::eprint(str("goose-scp: cannot connect to ", host, " port ", o.port, "\n")); return 255; }
+    let t = login::connect(o, host, o.port);
+    if t.rfd < 0 { sysnet::eprint(str("goose-scp: cannot connect to ", host, " port ", o.port, "\n")); return 255; }
     var c = ssh::client(cfg);
     var out: u8[>..] = [];
     ssh::client_start(c, cfg, out);
-    var cx = Ctx { o: o, l: Link { sock: sock, ch: -1, ready: false, gone: false, expand: false, preserve: preserve, deep: deep } };
+    var cx = Ctx { o: o, l: Link { sock: t.rfd, wsock: t.wfd, ch: -1, ready: false, gone: false, expand: false, preserve: preserve, deep: deep } };
 
     // The VERSION, which names the server's extensions.
     let vp = next_packet(cx.o, cfg, c, cx.l, out);
     let vm, vok = ssh::sftp_parse(vp);
     if vp.len == 0 || !vok || vm.kind != ssh::FXP_VERSION {
-        sysnet::net_close(sock);
+        login::close_transport(t);
         if vp.len > 0 { sysnet::eprint("goose-scp: the server did not answer INIT\n"); }
         return 255;
     }
@@ -812,8 +813,8 @@ fn run() -> i32 {
     }
     if cx.l.gone && !ssh::closed(c) { errors++; }
     ssh::disconnect(c, out);
-    let w = send_all(sock, out);
-    sysnet::net_close(sock);
+    let w = send_all(t.wfd, out);
+    login::close_transport(t);
     return if errors > 0 { 1 } else { 0 };
 }
 

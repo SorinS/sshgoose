@@ -461,6 +461,58 @@ int32_t proc_end(int32_t pid) {
     return proc_wait(pid, 1);
 }
 
+/* A client's proxy (-J, ProxyCommand): argv, its arguments each ended by
+   a NUL, run with its stdin and stdout on pipes and its stderr and terminal
+   ours, in this directory. The pipes' ends through to_fd (its stdin) and
+   from_fd (its stdout), both blocking; the pid, or -1. */
+int32_t proc_pipe(net_slice argv, int32_t *to_fd, int32_t *from_fd) {
+    char buf[65536];
+    char *av[256];
+    if (argv.len <= 0 || (size_t)argv.len > sizeof buf || argv.data[argv.len - 1] != 0) return -1;
+    memcpy(buf, argv.data, (size_t)argv.len);
+    int n = 0;
+    for (int64_t i = 0; i < argv.len && n < 255; ) {
+        av[n++] = buf + i;
+        while (buf[i]) i++;
+        i++;
+    }
+    av[n] = NULL;
+    int pin[2], pout[2];
+    if (pipe(pin) < 0) return -1;
+    if (pipe(pout) < 0) { close(pin[0]); close(pin[1]); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) { close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]); return -1; }
+    if (pid == 0) {
+        child_signals();
+        dup2(pin[0], 0);
+        dup2(pout[1], 1);
+        close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]);
+        execvp(av[0], av);
+        _exit(127);
+    }
+    close(pin[0]);
+    close(pout[1]);
+    *to_fd = pin[1];
+    *from_fd = pout[0];
+    return pid;
+}
+
+/* Ends a proxy whose pipes are closed: a second to go, then SIGTERM, a
+   second more, then SIGKILL. Its exit status, as proc_wait's. */
+int32_t proc_pipe_end(int32_t pid) {
+    if (pid <= 0) return 255;
+    for (int sig = 0; sig < 3; sig++) {
+        if (sig == 1) kill(pid, SIGTERM);
+        if (sig == 2) kill(pid, SIGKILL);
+        for (int i = 0; i < 100; i++) {
+            int32_t st = proc_wait(pid, 0);
+            if (st >= 0) return st;
+            usleep(10000);
+        }
+    }
+    return proc_wait(pid, 1);
+}
+
 /* fork(), for a server's connection: 0 in the child. Children of the
    server are reaped as they end. */
 int32_t proc_fork(void) {

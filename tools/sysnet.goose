@@ -44,6 +44,9 @@ extern fn proc_end(pid: i32) -> i32;
 extern fn proc_fork() -> i32;
 extern fn proc_reap();
 extern fn proc_exit(code: i32);
+// argv: each argument ended by a NUL. to_fd is its stdin, from_fd its stdout.
+extern fn proc_pipe(argv: const u8[:], to_fd: i32&, from_fd: i32&) -> i32;
+extern fn proc_pipe_end(pid: i32) -> i32;
 
 extern fn os_user(out: u8[:]) -> i64;
 extern fn os_home(out: u8[:]) -> i64;

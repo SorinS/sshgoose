@@ -2,7 +2,8 @@
 //
 //   goose-ssh [-p port] [-l user] [-i keyfile]... [-o option=value]... [-t | -T] [-v]
 //             [-L [bind:]port:host:hostport]... [-R [bind:]port:host:hostport]...
-//             [-D [bind:]port]... [-N] [user@]host [command...]
+//             [-D [bind:]port]... [-N] [-W host:port] [-J [user@]host[:port][,...]]
+//             [user@]host [command...]
 //
 // It logs in with the keys given with -i (by default ~/.ssh/id_ed25519,
 // id_ecdsa and id_rsa, where they are; for a protected key the passphrase
@@ -24,7 +25,13 @@
 // host:hostport; -R has the server listen (port 0: any, which it names)
 // and connects its connections here to host:hostport; -D is a SOCKS5 proxy
 // here whose connections the server makes. -N runs no command or shell,
-// only the forwards, until the connection ends.
+// only the forwards, until the connection ends. -W host:port joins stdin
+// and stdout to a connection the server makes to host:port, as OpenSSH's,
+// for a proxy: -J [user@]host[:port],... reaches the server through jump
+// hosts, each one's connection made by goose-ssh -W through the one
+// before (the same keys, known_hosts and host key policy for each); -o
+// ProxyJump= is -J, and -o ProxyCommand=command (%h, %p, %r) runs that for
+// the connection instead.
 import std;
 import os;
 import ssh from "..";
@@ -40,6 +47,7 @@ import .login;
 fn usage() -> i32 {
     sysnet::eprint("usage: goose-ssh [-p port] [-l user] [-i keyfile]... [-o option=value]... [-t | -T] [-v]\n");
     sysnet::eprint("                 [-L [bind:]port:host:hostport] [-R [bind:]port:host:hostport] [-D [bind:]port] [-N]\n");
+    sysnet::eprint("                 [-W host:port] [-J [user@]host[:port][,...]]\n");
     sysnet::eprint("                 [user@]host [command...]\n");
     return 255;
 }
@@ -117,6 +125,8 @@ fn run() -> i32 {
     var force_pty = 0;                      // 1: -t, -1: -T
     var forwards: u8[>..] = [];             // "kind bind port host hostport" lines (bind "-" for none)
     var no_command = false;
+    var stdio_host: u8[>..] = [];           // -W
+    var stdio_port: i64 = 0;
     var target: u8[>..] = [];
     var command: u8[>..] = [];
     var i = 1;
@@ -126,7 +136,16 @@ fn run() -> i32 {
             let t = login::take_option(o, a, i, "-p");
             if t < 0 { return usage(); }
             if t > 0 { continue; }
-            if (w == "-l" || w == "-L" || w == "-R" || w == "-D") && i + 1 >= a.len { return usage(); }
+            if (w == "-l" || w == "-L" || w == "-R" || w == "-D" || w == "-W") && i + 1 >= a.len { return usage(); }
+            if w == "-W" {
+                let u, h, p, okw = login::parse_hop(a[i + 1]);
+                if !okw || u.len > 0 || p == 0 { sysnet::eprint(str("goose-ssh: bad -W ", a[i + 1], "\n")); return 255; }
+                stdio_host.clear();
+                stdio_host.append(h);
+                stdio_port = p;
+                i += 2;
+                continue;
+            }
             if w == "-L" || w == "-R" || w == "-D" {
                 let f = parse_forward(w[1], a[i + 1]);
                 if f.len == 0 { sysnet::eprint(str("goose-ssh: bad forward ", w, " ", a[i + 1], "\n")); return 255; }
@@ -154,6 +173,8 @@ fn run() -> i32 {
         i++;
     }
     if target.len == 0 { return usage(); }
+    let stdio = stdio_host.len > 0;
+    if stdio && (command.len > 0 || no_command) { sysnet::eprint("goose-ssh: -W takes no command and no -N\n"); return 255; }
     // [user@]host
     let host = login::split_target(o, target);
     var cfg = login::config(o, host);
@@ -161,15 +182,16 @@ fn run() -> i32 {
     let verbose = o.verbose;
 
     login::log(o, str("connecting to ", host, " port ", port));
-    let sock = sysnet::net_connect(host, port as! i32);
-    if sock < 0 { return login::die(o, str("cannot connect to ", host, " port ", port)); }
+    let t = login::connect(o, host, port);
+    if t.rfd < 0 { return login::die(o, str("cannot connect to ", host, " port ", port)); }
+    let sock = t.rfd;
     var c = ssh::client(cfg);
     var out: u8[>..] = [];
     ssh::client_start(c, cfg, out);
-    if !send_all(sock, out) { return login::die(o, "write failed"); }
+    if !send_all(t.wfd, out) { return login::die(o, "write failed"); }
     let interactive_stdin = sysnet::tty_is(0) == 1;
     var s = Session { sock: sock, ch: -1, exit: -1, opened: false, done: false, stdin_eof: false,
-                      pty: force_pty == 1 || (force_pty == 0 && command.len == 0 && interactive_stdin),
+                      pty: !stdio && (force_pty == 1 || (force_pty == 0 && command.len == 0 && interactive_stdin)),
                       raw: false, cols: sysnet::tty_cols(0), rows: sysnet::tty_rows(0), failed: false, pending: [] };
     var input: u8[>..] = [];
     var rl = relay::new_relay(verbose);
@@ -279,7 +301,7 @@ fn run() -> i32 {
             }
             let le = login::login_event(o, cfg, c, e, events, out);
             if le < 0 {
-                let w = send_all(sock, out);
+                let w = send_all(t.wfd, out);
                 return login::die(o, "host key verification failed");
             }
             if le > 0 {
@@ -305,7 +327,16 @@ fn run() -> i32 {
                         sysnet::eprint(str("goose-ssh: cannot listen on ", bind, " port ", fp, "\n"));
                     }
                 }
-                if !no_command { s.ch = ssh::open_session(c, out); }
+                if stdio { s.ch = ssh::open_direct_tcpip(c, stdio_host, stdio_port as! u32, "127.0.0.1", 65535, out); }
+                else if !no_command { s.ch = ssh::open_session(c, out); }
+            } else if e.kind == ssh::EV_CHANNEL_OPENED && stdio {
+                login::log(o, str("connected to ", login::host_port(stdio_host, stdio_port)));
+                s.opened = true;
+            } else if e.kind == ssh::EV_EOF && stdio && e.channel == s.ch {
+                // The far end is done sending: so is our stdout, which a
+                // proxy's reader sees as the end.
+                flush_stdout();
+                sysnet::net_close(1);
             } else if e.kind == ssh::EV_CHANNEL_OPENED {
                 if s.pty {
                     var term: u8[>..] = [];
@@ -319,7 +350,9 @@ fn run() -> i32 {
                 s.opened = true;
                 if s.pty && interactive_stdin { s.raw = sysnet::tty_raw(0) == 0; }
             } else if e.kind == ssh::EV_CHANNEL_OPEN_FAILED {
-                sysnet::eprint(str("goose-ssh: channel refused: ", d, "\n"));
+                if stdio { sysnet::eprint(str("goose-ssh: -W ", login::host_port(stdio_host, stdio_port), ": ", d, "\n")); }
+                else { sysnet::eprint(str("goose-ssh: channel refused: ", d, "\n")); }
+                s.failed = stdio;
                 s.done = true;
             } else if e.kind == ssh::EV_DATA {
                 write_stdout(d);
@@ -348,7 +381,7 @@ fn run() -> i32 {
             rest.append(s.pending[n..]);
             s.pending = rest;
         }
-        if !send_all(sock, out) { s.failed = true; break; }
+        if !send_all(t.wfd, out) { s.failed = true; break; }
         if ssh::failed(c) {
             s.failed = true;
             break;
@@ -356,9 +389,10 @@ fn run() -> i32 {
         if ssh::closed(c) { s.done = true; }
     }
     if s.raw { sysnet::tty_restore(0); }
-    sysnet::net_close(sock);
+    login::close_transport(t);
     if ssh::failed(c) { return login::die(o, str("connection failed: ", c.message)); }
     if s.failed { return 255; }
+    if stdio { return if s.opened { 0 } else { 255 }; }
     return if s.exit >= 0 { s.exit as! i32 } else { 255 };
 }
 

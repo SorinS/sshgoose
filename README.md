@@ -84,6 +84,14 @@ It forwards ports as OpenSSH does: `-L [bind:]port:host:hostport` (a local
 port, the server connecting), `-R [bind:]port:host:hostport` (a port on the
 server, connected from here; port 0 has the server pick one, which it
 prints), `-D [bind:]port` (a SOCKS5 proxy), and `-N` for forwards alone.
+`-W host:port` joins stdin and stdout to a connection the server makes, as
+a proxy for another client; `-J [user@]host[:port][,...]` (or `-o
+ProxyJump=`) reaches the server through jump hosts as OpenSSH's does, each
+hop's connection made by `goose-ssh -W` (from beside goose-ssh) through the
+hop before it, with the same `-i` keys, known_hosts file and
+StrictHostKeyChecking (OpenSSH's jump client reads its config file
+instead); `-o ProxyCommand=command` runs that for the connection (`%h`,
+`%p`, `%r`, `%%`).
 For a passphrase-protected key it asks for the passphrase (three tries;
 empty skips the key) at the terminal, or runs `$SSH_ASKPASS` as ssh does
 (always with `SSH_ASKPASS_REQUIRE=force` or `prefer`, else when there is
@@ -106,9 +114,9 @@ and listens for -R on the loopback address (on the address asked for with
 processes), and tools/fs.c the file system's, for macOS and Linux.
 
 `goose-scp` copies files as OpenSSH's scp does by default (over SFTP):
-`[-r] [-p] [-q] [-v] [-P port] [-i keyfile] [-o option=value] source...
-target`, a remote file being `[user@]host:path`, with goose-ssh's login,
-keys, known_hosts and `-o` options. All the sources are local and the
+`[-r] [-p] [-q] [-v] [-P port] [-i keyfile] [-o option=value] [-J jump]
+source... target`, a remote file being `[user@]host:path`, with goose-ssh's
+login, keys, known_hosts, `-o` options and jump hosts. All the sources are local and the
 target remote, or the sources are on one host and the target local; a
 target that is a directory takes each source by its name, and several
 sources need one. A remote path starts from the home directory, `~` is
@@ -120,7 +128,7 @@ of 32 KiB in flight, as OpenSSH's. A file that fails is reported and the
 others still copied; the status is then 1. Not supported: copies between
 two remote hosts, the legacy scp protocol (`-O`; OpenSSH's `scp -O` to
 goose-sshd works through the remote `scp`), the progress meter (`-q` is
-taken and changes nothing), `-l`, `-3`, `-J`.
+taken and changes nothing), `-l`, `-3`.
 
 `goose-sftp-server` serves SFTP on stdin and stdout as OpenSSH's
 sftp-server, with the user's own file access: goose-sshd runs it, and so
@@ -204,7 +212,7 @@ on free ports of 127.0.0.1, and leaves nothing running.
   cancel-tcpip-forward; an unknown global request refused; replies in
   order; 40 channels at once.
 
-`scripts/interop.py` runs live connections on 127.0.0.1 (352 cases):
+`scripts/interop.py` runs live connections on 127.0.0.1 (367 cases):
 goose-ssh against an OpenSSH sshd (10.3, run as the user, with DH and
 ssh-rsa enabled again), Go's x/crypto/ssh server and goose-sshd, with
 every key exchange, cipher and MAC, every host key type, Ed25519 and RSA
@@ -234,6 +242,13 @@ empty files both ways, -rp with times and modes, into a directory, several
 sources, patterns, `~` and relative paths, a missing source, a directory
 without -r, an unwritable destination); OpenSSH's scp -rp and an sftp batch
 to goose-sshd and to goose-sftp-server.
+
+And jump hosts: goose-ssh -J through goose-sshd, OpenSSH sshd and Go's
+server, two hops, `-o ProxyJump`, 3 MB through a jump, goose-scp -J;
+OpenSSH ssh -J through goose-sshd; goose-ssh -W as OpenSSH ssh's
+ProxyCommand and OpenSSH ssh -W as goose-ssh's; -W to an sshd (its version
+line), -W and -J to closed ports (255), -W with a command refused, and no
+proxy left running.
 
 `tools/gossh` builds offline from the module cache
 (`GOFLAGS=-mod=mod GOPROXY=off GOSUMDB=off`).

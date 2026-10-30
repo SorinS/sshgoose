@@ -1,8 +1,10 @@
 // Logging in, for tools/ssh.goose and tools/scp.goose: the options they
-// share (-i, -o, -v and the port), the client's configuration from them
-// (keys, known_hosts, algorithms), and the events of the login that ask
-// the user something (an unknown host key, a password) or tell them (a
-// banner, the host key).
+// share (-i, -o, -v, -J and the port), the client's configuration from
+// them (keys, known_hosts, algorithms), the connection (TCP, or through a
+// proxy: -J and ProxyJump as OpenSSH's, goose-ssh -W through each jump
+// host, or ProxyCommand), and the events of the login that ask the user
+// something (an unknown host key, a password) or tell them (a banner, the
+// host key).
 namespace login;
 
 import std;
@@ -18,13 +20,15 @@ struct Options {
     host: u8[..256],                // as given, for the password prompt
     strict: u8[..16],               // StrictHostKeyChecking: ask, yes, accept-new, no
     verbose: bool,
+    jump: u8[..1024],               // -J, ProxyJump: [user@]host[:port] hops, comma-separated
+    proxy_command: u8[..4096],      // ProxyCommand, its %h, %p, %r and %% not yet put in
     known_hosts_file: u8[..4096],
     keyfiles: u8[..8192],           // one path per line
     algs: u8[..8192],               // "kind list" lines from -o
 }
 
 fn options(prog: const u8[:]) -> Options {
-    var o = Options { prog: [], port: 22, user: [], host: [], strict: [], verbose: false, known_hosts_file: [], keyfiles: [], algs: [] };
+    var o = Options { prog: [], port: 22, user: [], host: [], strict: [], verbose: false, jump: [], proxy_command: [], known_hosts_file: [], keyfiles: [], algs: [] };
     o.prog.append(prog);
     o.strict.append("ask");
     return o;
@@ -38,18 +42,23 @@ fn die(o: const Options&, s: const u8[:]) -> i32 {
 }
 
 // The option at a[i], if it is one of these (port_flag: "-p" for ssh, "-P"
-// for scp): 1 when taken (i moved past it), 0 when it is not one of them,
-// -1 when it is malformed.
+// for scp; -J; -i; -o; -v): 1 when taken (i moved past it), 0 when it is
+// not one of them, -1 when it is malformed. The last -J or ProxyJump, and
+// the last ProxyCommand, win; "none" turns either off.
 fn take_option(o: Options&, a: u8[:][:], i: i64&, port_flag: const u8[:]) -> i64 {
     let w = a[i];
     if w == "-v" { o.verbose = true; i++; return 1; }
-    if w != port_flag && w != "-i" && w != "-o" { return 0; }
+    if w != port_flag && w != "-i" && w != "-o" && w != "-J" { return 0; }
     if i + 1 >= a.len { return -1; }
     let v = a[i + 1];
     if w == port_flag {
         let p, ok = parse_int(v, 10);
         if !ok || p <= 0 || p > 65535 { return -1; }
         o.port = p;
+    } else if w == "-J" {
+        if v.len > o.jump.cap { return -1; }
+        o.jump.clear();
+        o.jump.append(v);
     } else if w == "-i" {
         if o.keyfiles.len + v.len + 1 > o.keyfiles.cap { return -1; }
         o.keyfiles.append(v);
@@ -65,6 +74,16 @@ fn take_option(o: Options&, a: u8[:][:], i: i64&, port_flag: const u8[:]) -> i64
             let p, ok = parse_int(v[5..], 10);
             if !ok || p <= 0 || p > 65535 { return -1; }
             o.port = p;
+        }
+        else if v.starts_with("ProxyJump=") {
+            if v.len - 10 > o.jump.cap { return -1; }
+            o.jump.clear();
+            o.jump.append(v[10..]);
+        }
+        else if v.starts_with("ProxyCommand=") {
+            if v.len - 13 > o.proxy_command.cap { return -1; }
+            o.proxy_command.clear();
+            o.proxy_command.append(v[13..]);
         }
         else if v.starts_with("User=") {
             if v.len - 5 > o.user.cap { return -1; }
@@ -163,6 +182,126 @@ fn config(o: Options&, host: const u8[:]) -> ssh::ClientConfig {
         }
     }
     return cfg;
+}
+
+// The way to the server: a socket (rfd == wfd), or a proxy's pipes, the
+// proxy's pid in pid.
+struct Transport { rfd: i32, wfd: i32, pid: i32 }
+
+// A host and port as -W and ProxyJump write them: an IPv6 address in
+// brackets.
+fn host_port(host: const u8[:], port: i64) -> u8[>..] {
+    if position(host, ':') >= 0 { return str("[", host, "]:", port); }
+    return str(host, ":", port);
+}
+
+// A hop of -J, [user@]host[:port]: the user ("" if none), the host, the
+// port (0 if none); false if malformed.
+fn parse_hop(hop: const u8[:]) -> u8[>..], u8[>..], i64, bool {
+    var user: u8[>..] = [];
+    var host: u8[>..] = [];
+    var rest = hop;
+    var at = -1;
+    for j in hop.len { if hop[j] == '@' { at = j; } }
+    if at >= 0 { user.append(hop[..at]); rest = hop[at + 1..]; }
+    var port: i64 = 0;
+    var hp = rest;
+    if rest.len > 0 && rest[0] == '[' {
+        let close = position(rest, ']');
+        if close < 0 { return user, host, 0, false; }
+        host.append(rest[1..close]);
+        hp = rest[close + 1..];
+        if hp.len > 0 && hp[0] != ':' { return user, host, 0, false; }
+        hp = if hp.len > 0 { hp[1..] } else { hp };
+        if hp.len > 0 { let p, ok = parse_int(hp, 10); if !ok || p <= 0 || p > 65535 { return user, host, 0, false; } port = p; }
+    } else {
+        let colon = position(rest, ':');
+        if colon >= 0 {
+            host.append(rest[..colon]);
+            let p, ok = parse_int(rest[colon + 1..], 10);
+            if !ok || p <= 0 || p > 65535 { return user, host, 0, false; }
+            port = p;
+        } else {
+            host.append(rest);
+        }
+    }
+    return user, host, port, host.len > 0;
+}
+
+fn add_arg(argv: u8[>..]&, a: const u8[:]) {
+    argv.append(a);
+    argv.push(0);
+}
+
+// Connects to host:port: through ProxyCommand (the user's shell runs it,
+// %h, %p, %r and %% put in), else through the last hop of -J (goose-ssh -W
+// host:port, from beside this program, the other hops its own -J, with
+// this one's keys, known_hosts and host key policy), else over TCP. rfd
+// < 0 if it could not.
+fn connect(o: const Options&, host: const u8[:], port: i64) -> Transport {
+    var none = Transport { rfd: -1, wfd: -1, pid: -1 };
+    var argv: u8[>..] = [];
+    if o.proxy_command.len > 0 && o.proxy_command != "none" {
+        var cmd: u8[>..] = [];
+        cmd.append("exec ");
+        var i = 0;
+        let pc = o.proxy_command;
+        while i < pc.len {
+            if pc[i] == '%' && i + 1 < pc.len {
+                let ch = pc[i + 1];
+                if ch == 'h' { cmd.append(host); }
+                else if ch == 'p' { format(cmd, port); }
+                else if ch == 'r' { cmd.append(o.user); }
+                else if ch == '%' { cmd.push('%'); }
+                else { cmd.push('%'); cmd.push(ch); }
+                i += 2;
+                continue;
+            }
+            cmd.push(pc[i]);
+            i++;
+        }
+        add_arg(argv, "/bin/sh");
+        add_arg(argv, "-c");
+        add_arg(argv, cmd);
+        log(o, str("proxy command: ", cmd));
+    } else if o.jump.len > 0 && o.jump != "none" {
+        // The last hop is the one that reaches the server; the ones before
+        // it are how the proxy reaches that hop.
+        var comma = -1;
+        for j in o.jump.len { if o.jump[j] == ',' { comma = j; } }
+        let hop = o.jump[comma + 1..];
+        let hu, hh, hp, ok = parse_hop(hop);
+        if !ok { sysnet::eprint(str(o.prog, ": bad jump host ", hop, "\n")); return none; }
+        add_arg(argv, str(resource_dir(), "goose-ssh"));
+        add_arg(argv, "-W");
+        add_arg(argv, host_port(host, port));
+        if comma > 0 { add_arg(argv, "-J"); add_arg(argv, o.jump[..comma]); }
+        if hp > 0 { add_arg(argv, "-p"); add_arg(argv, str(hp)); }
+        if hu.len > 0 { add_arg(argv, "-l"); add_arg(argv, hu); }
+        for path in split(o.keyfiles, '\n') { if path.len > 0 { add_arg(argv, "-i"); add_arg(argv, path); } }
+        add_arg(argv, "-o");
+        add_arg(argv, str("UserKnownHostsFile=", o.known_hosts_file));
+        add_arg(argv, "-o");
+        add_arg(argv, str("StrictHostKeyChecking=", o.strict));
+        if o.verbose { add_arg(argv, "-v"); }
+        add_arg(argv, hh);
+        log(o, str("jump host ", hop, " to ", host_port(host, port)));
+    } else {
+        let sock = sysnet::net_connect(host, port as! i32);
+        return Transport { rfd: sock, wfd: sock, pid: -1 };
+    }
+    var to: i32 = -1;
+    var from: i32 = -1;
+    let pid = sysnet::proc_pipe(argv, to, from);
+    if pid < 0 { return none; }
+    return Transport { rfd: from, wfd: to, pid: pid };
+}
+
+// Closes the way to the server, and waits for a proxy to end.
+fn close_transport(t: const Transport&) {
+    if t.rfd >= 0 { sysnet::net_close(t.rfd); }
+    if t.wfd >= 0 && t.wfd != t.rfd { sysnet::net_close(t.wfd); }
+    if t.pid > 0 { let st = sysnet::proc_pipe_end(t.pid); }
 }
 
 // The login's events that are the user's business: an unknown host key

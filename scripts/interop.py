@@ -35,6 +35,10 @@ as this user (its own config, DH and ssh-rsa enabled again, since OpenSSH
   goose-sftp-server (5 MB and empty files both ways, -r, -p, several
   sources, a pattern, ~ and relative paths, and refusals); OpenSSH scp and
   sftp to goose-sshd and to goose-sftp-server under OpenSSH sshd.
+- Jump hosts: goose-ssh -J through goose-sshd, OpenSSH sshd and Go's server,
+  two hops, -o ProxyJump, 3 MB through a jump, goose-scp -J; OpenSSH ssh -J
+  through goose-sshd; goose-ssh -W as OpenSSH's ProxyCommand, OpenSSH's ssh
+  -W as goose-ssh's; -W and -J to closed ports; no proxy left running.
 
     python3 scripts/interop.py [--goose PATH]
 """
@@ -467,6 +471,7 @@ def main():
 
         sftp_cases(k, sftp_server, {p_goose: "goose-sshd", p_openssh: "OpenSSH sshd + sftp-server",
                                     p_osftp: "OpenSSH sshd + goose-sftp-server"})
+        proxy_cases(k, p_goose, p_openssh, p_go)
     finally:
         for s in servers:
             s.kill()
@@ -678,6 +683,53 @@ def sftp_cases(k, sftp_server, servers):
         rc, out, err = run(["sftp", *o[:-2], "-P", str(port), "-b", "-", "127.0.0.1"], stdin=batch.encode(), timeout=120)
         check(f"OpenSSH sftp to {name}: a batch", rc == 0 and same(f5m, f"{dl}/sftp_back") and b"sd/u" in out and
               not os.path.exists(f"{w}/sd"), (rc, out[-300:], err))
+
+
+def proxy_cases(k, p_goose, p_openssh, p_go):
+    g = [k("goose-ssh"), "-i", k("user_ed25519"), "-o", f"UserKnownHostsFile={k('known_hosts')}",
+         "-o", "StrictHostKeyChecking=yes"]
+    with open(k("ssh_config"), "w") as f:
+        f.write(f"UserKnownHostsFile {k('known_hosts')}\nStrictHostKeyChecking yes\nIdentitiesOnly yes\nBatchMode yes\n"
+                f"IdentityFile {k('user_ed25519')}\n")
+    o = ["ssh", "-F", k("ssh_config")]
+    lo = "127.0.0.1"
+    for jump, jname, port, name in ((p_goose, "goose-sshd", p_openssh, "OpenSSH sshd"),
+                                    (p_openssh, "OpenSSH sshd", p_goose, "goose-sshd"),
+                                    (p_go, "Go's server", p_openssh, "OpenSSH sshd")):
+        rc, out, err = run([*g, "-J", f"{lo}:{jump}", "-p", str(port), lo, "echo", "jumped"])
+        check(f"goose-ssh -J {jname} to {name}", rc == 0 and out == b"jumped\n", (rc, out, err))
+    rc, out, err = run([*g, "-J", f"{lo}:{p_goose},{lo}:{p_openssh}", "-p", str(p_goose), lo, "echo", "two"])
+    check("goose-ssh -J two hops (goose-sshd, then OpenSSH sshd) to goose-sshd", rc == 0 and out == b"two\n", (rc, out, err))
+    rc, out, err = run([*g, "-o", f"ProxyJump={USER}@{lo}:{p_goose}", "-p", str(p_openssh), lo, "echo", "pj"])
+    check("goose-ssh -o ProxyJump=user@host:port", rc == 0 and out == b"pj\n", (rc, out, err))
+    data = os.urandom(3 * 1024 * 1024)
+    rc, out, err = run([*g, "-J", f"{lo}:{p_goose}", "-p", str(p_openssh), lo, "cat"], stdin=data)
+    check("goose-ssh -J: 3 MB through cat", rc == 0 and out == data, (rc, len(out), err[-200:]))
+    with open(k("jump_src"), "wb") as f:
+        f.write(data)
+    rc, out, err = run([k("goose-scp"), *g[1:], "-J", f"{lo}:{p_goose}", "-P", str(p_openssh), k("jump_src"),
+                        f"{lo}:{k('jump_dst')}"])
+    check("goose-scp -J goose-sshd to OpenSSH sshd", rc == 0 and open(k("jump_dst"), "rb").read() == data, (rc, err))
+    rc, out, err = run([*o, "-J", f"{lo}:{p_goose}", "-p", str(p_openssh), lo, "echo", "openssh"])
+    check("OpenSSH ssh -J goose-sshd to OpenSSH sshd", rc == 0 and out == b"openssh\n", (rc, out, err))
+    pc = " ".join([*g, "-p", str(p_goose), "-W", "%h:%p", lo])
+    rc, out, err = run([*o, "-o", f"ProxyCommand={pc}", "-p", str(p_openssh), lo, "echo", "gw"])
+    check("OpenSSH ssh with goose-ssh -W as its ProxyCommand", rc == 0 and out == b"gw\n", (rc, out, err))
+    pc = " ".join([*o, "-p", str(p_openssh), "-W", "%h:%p", lo])
+    rc, out, err = run([*g, "-o", f"ProxyCommand={pc}", "-p", str(p_goose), lo, "echo", "ow"])
+    check("goose-ssh with OpenSSH ssh -W as its ProxyCommand", rc == 0 and out == b"ow\n", (rc, out, err))
+    rc, out, err = run([*g, "-p", str(p_goose), "-W", f"{lo}:{p_openssh}", lo], stdin=b"SSH-2.0-probe\r\n", timeout=30)
+    check("goose-ssh -W to an sshd: its version line", rc == 0 and out.startswith(b"SSH-2.0-"), (rc, out[:40], err))
+    closed = free_port()
+    rc, out, err = run([*g, "-p", str(p_goose), "-W", f"{lo}:{closed}", lo], timeout=30)
+    check("goose-ssh -W to a closed port: 255", rc == 255 and b"-W" in err, (rc, err))
+    rc, out, err = run([*g, "-J", f"{lo}:{closed}", "-p", str(p_openssh), lo, "true"], timeout=30)
+    check("goose-ssh -J through a closed port: 255", rc == 255, (rc, err))
+    rc, out, err = run([*g, "-W", f"{lo}:{p_openssh}", "-p", str(p_goose), lo, "true"], timeout=30)
+    check("goose-ssh -W with a command refused", rc == 255, (rc, err))
+    time.sleep(0.5)
+    left = subprocess.run(["pgrep", "-f", k("goose-ssh") + " .*-W"], capture_output=True).stdout
+    check("no -W proxy left running", left == b"", left)
 
 
 if __name__ == "__main__":
